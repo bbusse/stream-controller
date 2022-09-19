@@ -50,7 +50,7 @@ def net_local_iface_address(probe_ip):
 
 
 def stream_setup_gstreamer(source, ip, port):
-    if source == "static-images":
+    if stream_source == "static-images":
         gstreamer = subprocess.Popen([
             'gst-launch-1.0', '-v', '-e',
             'fdsrc',
@@ -63,7 +63,7 @@ def stream_setup_gstreamer(source, ip, port):
             '!', 'tcpserversink', 'host=' + ip + '', 'port=' + str(port) + ''
             ], stdin=subprocess.PIPE, encoding='utf8')
 
-    elif source == "v4l2":
+    elif stream_source == "v4l2":
         gstreamer = subprocess.Popen([
             'gst-launch-1.0', '-v', '-e',
             'v4l2src device=/dev/video0',
@@ -265,7 +265,7 @@ if __name__ == "__main__":
         # Start streaming
         stream_create_v4l2_src("/dev/video0")
         gst = stream_setup_gstreamer(stream_source, ip, listen_port)
-    elif source == "static-images":
+    elif stream_source == "static-images":
         # Start browser
         logging.info("Starting browser")
         p = Popen(['webdriver_util.py'],
