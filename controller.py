@@ -49,7 +49,7 @@ def net_local_iface_address(probe_ip):
     return s.getsockname()[0]
 
 
-def stream_setup_gstreamer(source, ip, port):
+def stream_setup_gstreamer(source, ip, port, device):
     if stream_source == "static-images":
         gstreamer = subprocess.Popen([
             'gst-launch-1.0', '-v', '-e',
@@ -66,7 +66,7 @@ def stream_setup_gstreamer(source, ip, port):
     elif stream_source == "v4l2":
         gstreamer = subprocess.Popen([
             'gst-launch-1.0', '-v', '-e',
-            'v4l2src device=/dev/video0',
+            'v4l2src device=' + device,
             '!', 'videoconvert',
             '!', 'videorate',
             '!', 'video/x-raw,framerate=25/2',
@@ -78,16 +78,14 @@ def stream_setup_gstreamer(source, ip, port):
     return gstreamer
 
 
-def gst_stream_images(browser, url, gstreamer):
+def gst_stream_images(gstreamer, img_path):
     t0 = int(round(time.time() * 1000))
     n = 0
 
     while True:
-        browser.get(url)
         filename = img_path + '/image_' + str(n).zfill(4) + '.png'
-        browser.save_screenshot(filename)
         t1 = int(round(time.time() * 1000))
-        logging.info(ip + ":" + str(port) + " [" + url + "] " + str(t1 - t0) + " ms")
+        logging.info(filename + ": " + str(t1 - t0) + " ms")
         t0 = t1
 
         with open(filename, 'rb') as f:
@@ -152,6 +150,12 @@ if __name__ == "__main__":
                         help="The source of the stream",
                         type=str,
                         default="v4l2")
+    parser.add_argument('--stream-source-device',
+                        dest='stream_source_device',
+                        env_var='STREAM_SOURCE_DEVICE',
+                        help="The source device to stream from",
+                        type=str,
+                        default="/dev/video0")
     parser.add_argument('--listen-address',
                         dest='listen_address',
                         env_var='LISTEN_ADDRESS',
@@ -186,6 +190,7 @@ if __name__ == "__main__":
     debug = args.debug
     url = args.url
     stream_source = args.stream_source
+    stream_source_device = args.stream_source_device
     listen_address = args.listen_address
     listen_port = args.listen_port
     probe_ip = args.probe_ip
@@ -263,8 +268,13 @@ if __name__ == "__main__":
 
     if stream_source == "v4l2":
         # Start streaming
-        stream_create_v4l2_src("/dev/video0")
-        gst = stream_setup_gstreamer(stream_source, ip, listen_port)
+        stream_src_device = "/dev/video0"
+        stream_create_v4l2_src(stream_source_device)
+        gst = stream_setup_gstreamer(stream_source,
+                                     ip,
+                                     listen_port,
+                                     stream_source_device)
+
     elif stream_source == "static-images":
         # Start browser
         logging.info("Starting browser")
@@ -280,8 +290,12 @@ if __name__ == "__main__":
             if line != "":
                 logging.info('>>> {}'.format(line.rstrip()))
 
-        gstreamer = setup_gstreamer(source, ip, port)
-        gst_stream_images(gstreamer)
+        gstreamer = stream_setup_gstreamer(stream_source,
+                                           ip,
+                                           listen_port,
+                                           "")
+
+        gst_stream_images(gstreamer, "/tmp/browser-screenshots/")
         gstreamer.stdin.close()
         gstreamer.wait()
     else:
