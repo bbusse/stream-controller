@@ -261,12 +261,8 @@ if __name__ == "__main__":
 
     ip = net_local_iface_address(probe_ip)
 
-    for line in iter(p.stdout.readline, b''):
-        if line != "":
-            logging.info('>>> {}'.format(line.rstrip()))
-
-    # Start streaming
     if stream_source == "v4l2":
+        # Start streaming
         stream_create_v4l2_src("/dev/video0")
         gst = stream_setup_gstreamer(stream_source, ip, listen_port)
     elif source == "static-images":
@@ -279,6 +275,10 @@ if __name__ == "__main__":
                   start_new_session=True,
                   close_fds=False,
                   encoding='utf8')
+
+        for line in iter(p.stdout.readline, b''):
+            if line != "":
+                logging.info('>>> {}'.format(line.rstrip()))
 
         gstreamer = setup_gstreamer(source, ip, port)
         gst_stream_images(gstreamer)
