@@ -239,7 +239,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     if debug:
-        logging.debug(list_processes().decode())
+        logging.debug(list_processes())
 
     if listen_port < 1025 or listen_port > 65535:
         logging.error("Invalid port, aborting..")
