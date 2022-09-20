@@ -50,7 +50,7 @@ def net_local_iface_address(probe_ip):
     return s.getsockname()[0]
 
 
-def stream_setup_gstreamer(stream_source, ip, port, device):
+def stream_setup_gstreamer(stream_source, source_device, ip, port):
     if stream_source == "static-images":
         gstreamer = subprocess.Popen([
             'gst-launch-1.0', '-v', '-e',
@@ -67,8 +67,7 @@ def stream_setup_gstreamer(stream_source, ip, port, device):
     elif stream_source == "v4l2":
         gstreamer = subprocess.Popen([
             'gst-launch-1.0', '-v', '-e',
-            'v4l2src', 'device=' + device,
-            '!', 'videoconvert',
+            'v4l2src', 'device=' + source_device,
             '!', 'tcpserversink', 'host=' + ip + '', 'port=' + str(port) + ''
             ], stdin=subprocess.PIPE)
 
@@ -81,7 +80,7 @@ def gst_stream_v4l2src(gstreamer):
 
 def gst_stream_images(gstreamer, img_path, debug=False):
     t0 = int(round(time.time() * 1000))
-    n = 0
+    n = -1
 
     while True:
         filename = img_path + '/image_' + str(n).zfill(4) + '.png'
@@ -95,9 +94,13 @@ def gst_stream_images(gstreamer, img_path, debug=False):
         f = Path(filename)
 
         if not f.is_file():
-            logging.error("No file to stream")
+            logging.info("Startup: No file yet to stream")
+            logging.info("Startup: Waiting..")
             time.sleep(3)
         else:
+            if -1 == n:
+                logging.info("Found first file, starting stream")
+                n = 0
             with open(filename, 'rb') as f:
                 content = f.read()
                 gstreamer.stdin.write(content)
@@ -135,6 +138,18 @@ def stream_create_v4l2_src(device):
     #for line in iter(p.stdout.readline, b''):
     #    if line != "":
     #        logging.info('>>> {}'.format(line.rstrip()))
+
+    return True
+
+
+def start_browser():
+    p = Popen(['webdriver_util.py'],
+              stdout=subprocess.PIPE,
+              stderr=subprocess.STDOUT,
+              env=env,
+              start_new_session=True,
+              close_fds=True,
+              encoding='utf8')
 
     return True
 
@@ -283,39 +298,27 @@ if __name__ == "__main__":
 
     local_ip = net_local_iface_address(probe_ip)
 
+    logging.info("Starting browser")
+    start_browser()
+
     if stream_source == "v4l2":
         # Start streaming
         logging.info("Setting up source")
-        stream_src_device = "/dev/video0"
         stream_create_v4l2_src(stream_source_device)
         logging.info("Setting up stream")
         gst = stream_setup_gstreamer(stream_source,
+                                     stream_source_device,
                                      local_ip,
-                                     listen_port,
-                                     stream_source_device)
+                                     listen_port)
         gst_stream_v4l2src(gst)
         gst.stdin.close()
         gst.wait()
 
     elif stream_source == "static-images":
-        # Start browser
-        logging.info("Starting browser")
-        p = Popen(['webdriver_util.py'],
-                  stdout=subprocess.PIPE,
-                  stderr=subprocess.STDOUT,
-                  env=env,
-                  start_new_session=True,
-                  close_fds=True,
-                  encoding='utf8')
-
-        #for line in iter(p.stdout.readline, b''):
-        #    if line != "":
-        #        logging.info('>>> {}'.format(line.rstrip()))
-
         gst = stream_setup_gstreamer(stream_source,
-                                           local_ip,
-                                           listen_port,
-                                           "")
+                                     stream_source_device,
+                                     local_ip,
+                                     listen_port)
 
         gst_stream_images(gst, img_path)
         gst.stdin.close()
