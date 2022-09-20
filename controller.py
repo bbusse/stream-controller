@@ -49,7 +49,7 @@ def net_local_iface_address(probe_ip):
     return s.getsockname()[0]
 
 
-def stream_setup_gstreamer(source, ip, port, device):
+def stream_setup_gstreamer(stream_source, ip, port, device):
     if stream_source == "static-images":
         gstreamer = subprocess.Popen([
             'gst-launch-1.0', '-v', '-e',
@@ -66,16 +66,16 @@ def stream_setup_gstreamer(source, ip, port, device):
     elif stream_source == "v4l2":
         gstreamer = subprocess.Popen([
             'gst-launch-1.0', '-v', '-e',
-            'v4l2src device=' + device,
+            'v4l2src', 'device=' + device,
             '!', 'videoconvert',
-            '!', 'videorate',
-            '!', 'video/x-raw,framerate=25/2',
-            '!', 'theoraenc',
-            '!', 'oggmux',
-            '!', 'tcpserversink', 'host=' + ip + '', 'port=' + str(port) + ''
+            '!', 'tcpserversink'
             ], stdin=subprocess.PIPE, encoding='utf8')
 
     return gstreamer
+
+
+def gst_stream_v4l2src(gstreamer):
+    return True
 
 
 def gst_stream_images(gstreamer, img_path):
@@ -105,7 +105,7 @@ def stream_create_v4l2_src(device):
         sys.exit(1)
 
     # Create v4l2 recording of screen
-    logging.info("Creating v4l2 stream with: " + device)
+    logging.info("Creating v4l2 stream with device: " + device)
     p = subprocess.Popen([
                 'wf-recorder',
                 '--muxer=v4l2',
@@ -122,9 +122,9 @@ def stream_create_v4l2_src(device):
     p.stdin.write('Y\n')
     p.stdin.flush()
 
-    for line in iter(p.stdout.readline, b''):
-        if line != "":
-            logging.info('>>> {}'.format(line.rstrip()))
+    #for line in iter(p.stdout.readline, b''):
+    #    if line != "":
+    #        logging.info('>>> {}'.format(line.rstrip()))
 
     return True
 
@@ -264,16 +264,21 @@ if __name__ == "__main__":
         logging.info("Possible choices are: " + sources_str)
         sys.exit(1)
 
-    ip = net_local_iface_address(probe_ip)
+    local_ip = net_local_iface_address(probe_ip)
 
     if stream_source == "v4l2":
         # Start streaming
+        logging.info("Setting up source")
         stream_src_device = "/dev/video0"
         stream_create_v4l2_src(stream_source_device)
+        logging.info("Setting up stream")
         gst = stream_setup_gstreamer(stream_source,
-                                     ip,
+                                     local_ip,
                                      listen_port,
                                      stream_source_device)
+        gst_stream_v4l2src(gst)
+        gst.stdin.close()
+        gst.wait()
 
     elif stream_source == "static-images":
         # Start browser
@@ -283,21 +288,21 @@ if __name__ == "__main__":
                   stderr=subprocess.STDOUT,
                   env=env,
                   start_new_session=True,
-                  close_fds=False,
+                  close_fds=True,
                   encoding='utf8')
 
         for line in iter(p.stdout.readline, b''):
             if line != "":
                 logging.info('>>> {}'.format(line.rstrip()))
 
-        gstreamer = stream_setup_gstreamer(stream_source,
-                                           ip,
+        gst = stream_setup_gstreamer(stream_source,
+                                           local_ip,
                                            listen_port,
                                            "")
 
         gst_stream_images(gstreamer, "/tmp/browser-screenshots/")
-        gstreamer.stdin.close()
-        gstreamer.wait()
+        gst.stdin.close()
+        gst.wait()
     else:
         logging.error("Missing streaming source configuration. Exiting.")
         sys.exit(1)
