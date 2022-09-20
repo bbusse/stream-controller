@@ -294,9 +294,6 @@ if __name__ == "__main__":
 
     local_ip = net_local_iface_address(probe_ip)
 
-    logging.info("Starting browser")
-    start_browser()
-
     if stream_source == "v4l2":
         # Start streaming
         logging.info("Setting up source")
@@ -311,6 +308,9 @@ if __name__ == "__main__":
         gst.wait()
 
     elif stream_source == "static-images":
+        logging.info("Starting browser")
+        start_browser()
+
         gst = stream_setup_gstreamer(stream_source,
                                      stream_source_device,
                                      local_ip,
@@ -319,6 +319,11 @@ if __name__ == "__main__":
         gst_stream_images(gst, img_path)
         gst.stdin.close()
         gst.wait()
+
+    elif stream_source == "vnc-browser":
+        logging.info("Starting browser")
+        start_browser()
+
     else:
         logging.error("Missing streaming source configuration. Exiting.")
         sys.exit(1)
