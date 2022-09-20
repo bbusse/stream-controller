@@ -13,7 +13,7 @@ import time
 from flask import Flask
 
 app = Flask(__name__)
-stream_sources = ["static-images", "v4l2"]
+stream_sources = ["static-images", "v4l2", "vnc-browser"]
 
 
 @app.route("/")
