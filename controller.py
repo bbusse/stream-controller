@@ -174,7 +174,7 @@ if __name__ == "__main__":
                         env_var='STREAM_SOURCE',
                         help="The source of the stream",
                         type=str,
-                        default="v4l2")
+                        default="")
     parser.add_argument('--stream-source-device',
                         dest='stream_source_device',
                         env_var='STREAM_SOURCE_DEVICE',
