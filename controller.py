@@ -286,10 +286,6 @@ if __name__ == "__main__":
         logging.error("Not a valid URL, aborting..")
         sys.exit(1)
 
-    if not stream_source:
-        logging.error("No source defined")
-        sys.exit(1)
-
     if stream_source not in stream_sources:
         sources_str = " ".join(str(x) for x in stream_sources)
         logging.error("Invalid source, aborting..")
