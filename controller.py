@@ -104,6 +104,7 @@ def gst_stream_images(gstreamer, img_path, debug=False):
             with open(filename, 'rb') as f:
                 content = f.read()
                 gstreamer.stdin.write(content)
+                time.sleep(0.1)
 
         if 10 == n:
             n = 0
