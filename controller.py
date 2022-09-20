@@ -83,7 +83,7 @@ def gst_stream_images(gstreamer, img_path, debug=False):
     n = -1
 
     while True:
-        filename = img_path + '/image_' + str(n).zfill(4) + '.png'
+        filename = img_path + '/image_' + str(0).zfill(4) + '.png'
         t1 = int(round(time.time() * 1000))
 
         if debug:
