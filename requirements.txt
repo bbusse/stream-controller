@@ -1,3 +1,4 @@
 configargparse >= 1.2.3
 Flask >= 1.1.2
 selenium >= 4.4.3
+zeroconf >= 0.3.9
