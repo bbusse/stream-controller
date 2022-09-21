@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 
 import configargparse
+from flask import Flask
 import logging
 import os
 from pathlib import Path
 import socket
 import stat
 import subprocess
-from subprocess import Popen, PIPE
+from subprocess import Popen
+import signal
 import sys
 import time
-from flask import Flask
+from zeroconf import IPVersion, ServiceInfo, Zeroconf
 
 app = Flask(__name__)
 stream_sources = ["static-images", "v4l2", "vnc-browser"]
@@ -33,6 +35,51 @@ def healthz():
     return probe_liveness()
 
 
+class Zeroconf_service:
+
+    def __init__(self,
+                 name_prefix,
+                 service_type,
+                 hostname,
+                 listen_address,
+                 listen_port,
+                 properties):
+
+        ip_version = IPVersion.V6Only
+        self.service_type = service_type
+        self.service_name = name_prefix + "-" + \
+            hostname + "." + \
+            self.service_type
+
+        # The zeroconf service data to publish on the network
+        self.zc_service = ServiceInfo(
+            self.service_type,
+            self.service_name,
+            addresses=[socket.inet_pton(socket.AF_INET,
+                                        listen_address)],
+            port=int(listen_port),
+            properties=properties,
+            server=hostname + ".local.",
+        )
+
+        self.zc = Zeroconf(ip_version=ip_version)
+
+    def zc_register_service(self):
+        self.zc.register_service(self.zc_service)
+
+        return True
+
+    def zc_unregister_service(self):
+        self.zc.unregister_service(self.zc_service)
+        zc.close()
+
+        return True
+
+
+def probe_liveness():
+    return "OK"
+
+
 def list_processes():
     ps = subprocess.Popen(['ps', 'aux'],
                           stdout=subprocess.PIPE,
@@ -40,13 +87,10 @@ def list_processes():
     return ps
 
 
-def probe_liveness():
-    return "OK"
-
-
 def net_local_iface_address(probe_ip):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.connect((probe_ip, 80))
+
     return s.getsockname()[0]
 
 
@@ -126,8 +170,6 @@ def stream_create_v4l2_src(device):
                 '--file=/dev/video0',
                 ],
                 stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
                 start_new_session=True,
                 close_fds=False,
                 encoding='utf8')
@@ -136,21 +178,15 @@ def stream_create_v4l2_src(device):
     p.stdin.write('Y\n')
     p.stdin.flush()
 
-    #for line in iter(p.stdout.readline, b''):
-    #    if line != "":
-    #        logging.info('>>> {}'.format(line.rstrip()))
-
     return True
 
 
 def start_browser():
-    p = Popen(['webdriver_util.py'],
-              stdout=subprocess.PIPE,
-              stderr=subprocess.STDOUT,
-              env=env,
-              start_new_session=True,
-              close_fds=True,
-              encoding='utf8')
+    Popen(['webdriver_util.py'],
+          env=env,
+          start_new_session=True,
+          close_fds=True,
+          encoding='utf8')
 
     return True
 
@@ -217,6 +253,24 @@ if __name__ == "__main__":
                         help="The address to probe for",
                         type=str,
                         default="9.9.9.9")
+    parser.add_argument('--zeroconf-publish-service',
+                        dest='zeroconf_publish_service',
+                        env_var='ZEROCONF_PUBLISH',
+                        help="Publish service via mDNS",
+                        type=bool,
+                        default=False)
+    parser.add_argument('--zeroconf-service-name-prefix',
+                        dest='zeroconf_service_name_prefix',
+                        env_var='ZEROCONF_PREFIX',
+                        help="The name prefix of the service",
+                        type=str,
+                        default="controller")
+    parser.add_argument('--zeroconf-service-type',
+                        dest='zeroconf_service_type',
+                        env_var='ZEROCONF_TYPE',
+                        help="The type of service",
+                        type=str,
+                        default="_http._tcp.local.")
 
     args = parser.parse_args()
     debug = args.debug
@@ -227,10 +281,14 @@ if __name__ == "__main__":
     listen_address = args.listen_address
     listen_port = args.listen_port
     probe_ip = args.probe_ip
+    zeroconf_publish_service = args.zeroconf_publish_service
+    zc_service_name_prefix = args.zeroconf_service_name_prefix
+    zc_service_type = args.zeroconf_service_type
     logfile = args.logfile
     loglevel = args.loglevel
     log_format = '[%(asctime)s] \
     {%(filename)s:%(lineno)d} %(levelname)s - %(message)s'
+    del locals()['args']
 
     # Optional File Logging
     if logfile:
@@ -293,6 +351,7 @@ if __name__ == "__main__":
         logging.info("Possible choices are: " + sources_str)
         sys.exit(1)
 
+    hostname = socket.gethostname()
     local_ip = net_local_iface_address(probe_ip)
 
     if stream_source == "v4l2":
@@ -309,7 +368,7 @@ if __name__ == "__main__":
         gst.wait()
 
     elif stream_source == "static-images":
-        logging.info("Starting browser")
+        logging.info("Starting browser with " + url)
         start_browser()
 
         gst = stream_setup_gstreamer(stream_source,
@@ -329,5 +388,46 @@ if __name__ == "__main__":
         logging.error("Missing streaming source configuration. Exiting.")
         sys.exit(1)
 
-    # Start webserver
+    # Publish service on the network via mDNS
+    if zeroconf_publish_service:
+        zc_listen_address = listen_address
+
+        if "0.0.0.0" == zc_listen_address:
+            zc_listen_address = net_local_iface_address(probe_ip)
+
+        zc_listen_port = listen_port
+
+        logging.info("zeroconf: Publishing service of type " \
+            + zc_service_type + " with name prefix " \
+            + zc_service_name_prefix + " on " \
+            + zc_listen_address + ":" + str(zc_listen_port))
+
+        zc_service_properties = {"stream_source": stream_source}
+
+        zc = Zeroconf_service(zc_service_name_prefix,
+                              zc_service_type,
+                              hostname,
+                              zc_listen_address,
+                              zc_listen_port,
+                              zc_service_properties)
+
+        r = zc.zc_register_service()
+
+        if not r:
+            logging.error("zeroconf: Failed to publish service")
+
+    # Set up signal handler
+    def signal_handler(number, *args):
+        logging.info('Signal received:', number)
+
+        # Unpublish service
+        if zeroconf_publish_service and zc:
+            zc.unregister_service()
+
+        sys.exit(0)
+
+    # Register signal handler
+    signal.signal(signal.SIGINT, signal_handler)
+
+    # Start webserver for health endpoints
     app.run(host=listen_address)
