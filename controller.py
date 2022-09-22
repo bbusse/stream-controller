@@ -15,6 +15,7 @@ import time
 from zeroconf import IPVersion, ServiceInfo, Zeroconf
 
 app = Flask(__name__)
+dependencies = []
 stream_sources = ["static-images", "v4l2", "vnc-browser"]
 
 
@@ -33,6 +34,23 @@ def healthy():
 @app.route('/healthz')
 def healthz():
     return probe_liveness()
+
+
+def which(cmd):
+    def is_exe(fpath):
+        return os.path.isfile(fpath) and os.access(fpath, os.X_OK)
+
+    fpath, fname = os.path.split(cmd)
+    if fpath:
+        if is_exe(cmd):
+            return cmd
+    else:
+        for path in os.environ["PATH"].split(os.pathsep):
+            exe_file = os.path.join(path, cmd)
+            if is_exe(exe_file):
+                return exe_file
+
+    return None
 
 
 class Zeroconf_service:
@@ -181,8 +199,13 @@ def stream_create_v4l2_src(device):
     return True
 
 
-def start_browser():
-    Popen(['webdriver_util.py'],
+def start_browser(urls):
+    cmd = ['webdriver_util.py']
+    for url in urls:
+        cmd.append("--url")
+        cmd.append(url)
+
+    Popen(cmd,
           env=env,
           start_new_session=True,
           close_fds=True,
@@ -201,11 +224,12 @@ if __name__ == "__main__":
                         type=bool,
                         default=False)
     parser.add_argument('--url',
-                        dest='url',
+                        dest='urls',
                         env_var='URL',
-                        help="The URL to open in a browser",
+                        help="The URL to open in a browser, can be supplied multiple times",
                         type=str,
-                        default="")
+                        action='append',
+                        required=True)
     parser.add_argument('--stream_source',
                         dest='stream_source',
                         env_var='STREAM_SOURCE',
@@ -274,7 +298,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     debug = args.debug
-    url = args.url
+    urls = args.urls
     stream_source = args.stream_source
     stream_source_device = args.stream_source_device
     img_path = args.img_path
@@ -321,6 +345,12 @@ if __name__ == "__main__":
     level = logging.getLevelName(loglevel)
     logger.setLevel(level)
 
+    for dep in dependencies:
+        if which(dep) is None:
+            logging.error("Could not find dependency: " + dep + ", aborting..")
+
+        sys.exit(1)
+
     env = os.environ.copy()
 
     if debug:
@@ -339,10 +369,6 @@ if __name__ == "__main__":
 
     if listen_port < 1025 or listen_port > 65535:
         logging.error("Invalid port, aborting..")
-        sys.exit(1)
-
-    if len(url) < 12:
-        logging.error("Not a valid URL, aborting..")
         sys.exit(1)
 
     if stream_source not in stream_sources:
@@ -368,8 +394,8 @@ if __name__ == "__main__":
         gst.wait()
 
     elif stream_source == "static-images":
-        logging.info("Starting browser with " + url)
-        start_browser()
+        logging.info("Starting browser with " + str(len(urls)) + "URLs")
+        start_browser(urls)
 
         gst = stream_setup_gstreamer(stream_source,
                                      stream_source_device,
@@ -382,7 +408,7 @@ if __name__ == "__main__":
 
     elif stream_source == "vnc-browser":
         logging.info("Starting browser")
-        start_browser()
+        start_browser(urls)
 
     else:
         logging.error("Missing streaming source configuration. Exiting.")
