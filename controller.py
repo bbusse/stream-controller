@@ -130,6 +130,9 @@ def stream_setup_gstreamer(stream_source, source_device, ip, port):
         gstreamer = subprocess.Popen([
             'gst-launch-1.0', '-v', '-e',
             'v4l2src', 'device=' + source_device,
+            '!', 'videorate',
+            '!', 'video/x-raw,framerate=25/2',
+            '!', 'queue',
             '!', 'tcpserversink', 'host=' + ip + '', 'port=' + str(port) + ''
             ], stdin=subprocess.PIPE)
 
@@ -185,7 +188,7 @@ def stream_create_v4l2_src(device):
     p = subprocess.Popen([
                 'wf-recorder',
                 '--muxer=v4l2',
-                '--file=/dev/video0',
+                '--file=' + device,
                 ],
                 stdin=subprocess.PIPE,
                 start_new_session=True,
@@ -197,6 +200,17 @@ def stream_create_v4l2_src(device):
     p.stdin.flush()
 
     return True
+
+
+def stream_v4l2_ffmpeg():
+    ffmpeg = subprocess.Popen([
+        'ffmpeg', '-f', 'v4l2', '-i', '/dev/video0',
+        '-codec', 'copy',
+        '-f', 'mpegts', 'udp:localhost:6000'
+        ],
+        stdin=subprocess.PIPE,
+        start_new_session=True,
+        close_fds=False)
 
 
 def start_browser(urls):
@@ -296,7 +310,14 @@ if __name__ == "__main__":
                         type=str,
                         default="_http._tcp.local.")
 
+
     args = parser.parse_args()
+    # workaround: Make url a new list if first element contains a '|'
+    # since we can specify --url multiple times but not URL as
+    # an env var. We use pipe: | as seperator since it is not allow in URLs
+    if args.urls[0].find("|") != -1:
+        args.urls = args.urls[0].split("|")
+
     debug = args.debug
     urls = args.urls
     stream_source = args.stream_source
@@ -385,13 +406,16 @@ if __name__ == "__main__":
         logging.info("Setting up source")
         stream_create_v4l2_src(stream_source_device)
         logging.info("Setting up stream")
-        gst = stream_setup_gstreamer(stream_source,
-                                     stream_source_device,
-                                     local_ip,
-                                     listen_port)
-        gst_stream_v4l2src(gst)
-        gst.stdin.close()
-        gst.wait()
+        time.sleep(3)
+        start_browser(urls)
+        stream_v4l2_ffmpeg()
+        #gst = stream_setup_gstreamer(stream_source,
+        #                             stream_source_device,
+        #                             local_ip,
+        #                             listen_port)
+        #gst_stream_v4l2src(gst)
+        #gst.stdin.close()
+        #gst.wait()
 
     elif stream_source == "static-images":
         logging.info("Starting browser with " + str(len(urls)) + "URLs")
