@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 
+import asyncio
 import configargparse
 from flask import Flask
+from hnapi import HnApi
+import html
+import json
 import logging
 import os
 from pathlib import Path
+import psutil
+import random
 import socket
 import stat
 import subprocess
@@ -12,16 +18,23 @@ from subprocess import Popen
 import signal
 import sys
 import time
+import threading
+sys.path.append(os.path.abspath("/usr/local/src/python-wayland"))
+import draw as view
+import wayland.protocol
+from wayland.client import MakeDisplay
+from wayland.utils import AnonymousFile
 from zeroconf import IPVersion, ServiceInfo, Zeroconf
 
 app = Flask(__name__)
-dependencies = []
+dependencies = ["xrandr"]
 stream_sources = ["static-images", "v4l2", "vnc-browser"]
-
+cmds = {"media_player": "mpv",
+        "image_viewer": "imv"}
 
 @app.route("/")
 def info():
-    return app
+    return True
 
 
 # Readiness
@@ -53,63 +66,21 @@ def which(cmd):
     return None
 
 
-class Zeroconf_service:
-
-    def __init__(self,
-                 name_prefix,
-                 service_type,
-                 hostname,
-                 listen_address,
-                 listen_port,
-                 properties):
-
-        ip_version = IPVersion.V6Only
-        self.service_type = service_type
-        self.service_name = name_prefix + "-" + \
-            hostname + "." + \
-            self.service_type
-
-        # The zeroconf service data to publish on the network
-        self.zc_service = ServiceInfo(
-            self.service_type,
-            self.service_name,
-            addresses=[socket.inet_pton(socket.AF_INET,
-                                        listen_address)],
-            port=int(listen_port),
-            properties=properties,
-            server=hostname + ".local.",
-        )
-
-        self.zc = Zeroconf(ip_version=ip_version)
-
-    def zc_register_service(self):
-        self.zc.register_service(self.zc_service)
-
-        return True
-
-    def zc_unregister_service(self):
-        self.zc.unregister_service(self.zc_service)
-        zc.close()
-
-        return True
-
-
 def probe_liveness():
     return "OK"
 
 
-def list_processes():
-    ps = subprocess.Popen(['ps', 'aux'],
-                          stdout=subprocess.PIPE,
-                          encoding="utf8").communicate()[0]
-    return ps
+def download_file(url, path):
+    logging.info("Downloading: " + url)
+    cmd = ['curl', '-LO', '--create-dirs', '--output-dir', path,  url]
 
+    Popen(cmd,
+          env=env,
+          start_new_session=True,
+          close_fds=True,
+          encoding='utf8')
 
-def net_local_iface_address(probe_ip):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.connect((probe_ip, 80))
-
-    return s.getsockname()[0]
+    return True
 
 
 def stream_setup_gstreamer(stream_source, source_device, ip, port):
@@ -137,10 +108,6 @@ def stream_setup_gstreamer(stream_source, source_device, ip, port):
             ], stdin=subprocess.PIPE)
 
     return gstreamer
-
-
-def gst_stream_v4l2src(gstreamer):
-    return True
 
 
 def gst_stream_images(gstreamer, img_path, debug=False):
@@ -212,20 +179,374 @@ def stream_v4l2_ffmpeg():
         start_new_session=True,
         close_fds=False)
 
+class System:
 
-def start_browser(urls):
-    cmd = ['webdriver_util.py']
-    for url in urls:
-        cmd.append("--url")
-        cmd.append(url)
+    def list_processes():
+        ps = subprocess.Popen(['ps', 'aux'],
+                              stdout=subprocess.PIPE,
+                              encoding="utf8").communicate()[0]
+        return ps
 
-    Popen(cmd,
-          env=env,
-          start_new_session=True,
-          close_fds=True,
-          encoding='utf8')
 
-    return True
+    def net_local_iface_address(probe_ip):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect((probe_ip, 80))
+
+        return s.getsockname()[0]
+
+
+class Zeroconf_service:
+
+    def __init__(self,
+                 name_prefix,
+                 service_type,
+                 hostname,
+                 listen_address,
+                 listen_port,
+                 properties):
+
+        ip_version = IPVersion.V6Only
+        self.service_type = service_type
+        self.service_name = name_prefix + "-" + \
+            hostname + "." + \
+            self.service_type
+
+        # The zeroconf service data to publish on the network
+        self.zc_service = ServiceInfo(
+            self.service_type,
+            self.service_name,
+            addresses=[socket.inet_pton(socket.AF_INET,
+                                        listen_address)],
+            port=int(listen_port),
+            properties=properties,
+            server=hostname + ".local.",
+        )
+
+        self.zc = Zeroconf(ip_version=ip_version)
+
+    def zc_register_service(self):
+        self.zc.register_service(self.zc_service)
+
+        return True
+
+    def zc_unregister_service(self):
+        self.zc.unregister_service(self.zc_service)
+        zc.close()
+
+        return True
+
+
+class News:
+
+    def __init__(self):
+        self.news = []
+        self.fetch_top_news(10)
+
+    def fetch_top_news(self, nitems):
+        n = 0
+
+        logging.info("Fetching News")
+        con = HnApi()
+        top = con.get_top()
+
+        for tnews in top:
+            if n == nitems:
+                break
+
+            self.news.append(con.get_item(tnews))
+            n += 1
+
+    # news_item returns a single news text
+    # from the previously fetched ones
+    def news_item(self):
+        n = {"title": "",
+             "url": ""}
+
+        n["title"] = self.news.pop(0).get('title')
+        n["url"] = self.news.pop(0).get('url')
+
+        return n
+
+
+class Wayland_view:
+
+    def __init__(self, res_x, res_y):
+        # Load the main Wayland protocol.
+        wp_base = wayland.protocol.Protocol("/usr/share/wayland/wayland.xml")
+        wp_xdg_shell = wayland.protocol.Protocol("/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml")
+
+        try:
+            self.conn = view.WaylandConnection(wp_base, wp_xdg_shell)
+        except FileNotFoundError as e:
+            if e.errno == 2:
+                print("Unable to connect to the compositor - "
+                      "is one running?")
+                sys.exit(1)
+            raise
+
+        self.window = {}
+        self.window["res_x"] = res_x
+        self.window["res_y"] = res_y
+        self.window["title"] = "News"
+
+        self.s_object = {"alignment": "center",
+                         "offset_x": 10,
+                         "offset_y": 10,
+                         "bg_colour_r": 7,
+                         "bg_colour_g": 59,
+                         "bg_colour_b": 76,
+                         "font_face": "monospace",
+                         "font_size": 60,
+                         "font_colour_r": 0,
+                         "font_colour_g": 0,
+                         "font_colour_b": 0,
+                         "file": "",
+                         "text": ""}
+
+    def show_text(self, text, fullscreen=False):
+        self.s_object["text"] = html.escape(text)
+        w = view.Window(self.conn,
+                        self.window,
+                        self.s_object,
+                        redraw=view.draw_text_in_window,
+                        fullscreen=fullscreen)
+
+    def show_image(self, file, fullscreen=False):
+        self.s_object["file"] = file
+        w = view.Window(self.conn,
+                        self.window,
+                        self.s_object,
+                        redraw=view.draw_img_in_window,
+                        fullscreen=fullscreen)
+
+        view.eventloop()
+
+        w.close()
+        self.conn.display.roundtrip()
+        self.conn.disconnect()
+        logging.info("Exiting wayland view: {}".format(view.shutdowncode))
+
+
+class Display:
+
+    def __init__(self):
+        res = self.get_resolution().split("x")
+        self.res_x = int(res[0])
+        self.res_y = int(res[1])
+        self.start_time = time.time()
+        self.switching_windows = list()
+        self.window_blacklist = list()
+
+        logging.info("Resolution: {} x {}"
+                     .format(self.res_x, self.res_y))
+
+        # We do not want to handle existing windows,
+        # so we put their IDs on a blacklist
+        existing_windows = self.get_windows()
+        for win in existing_windows:
+            self.window_blacklist.append(win["id"])
+
+        logging.info("Blacklisted {} windows".format(len(self.window_blacklist)))
+
+    def get_resolution(self):
+        cmd = "xrandr -q | awk '/\*/ {print $1}' \
+               | awk 'BEGIN{FS=\"x\";} NR==1 || \
+               $1>max {line=$0; max=$1}; END {print line}'"
+
+        p = subprocess.Popen(cmd,
+                             shell=True,
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE,
+                             encoding="utf8")
+
+        res = p.communicate()[0]
+
+        return res
+
+    def get_windows_whitelist(self):
+        windows = self.get_windows(self.window_blacklist)
+        logging.info("display: {} windows in whitelist".format(len(windows)))
+
+        return windows
+
+    def get_windows(self, blacklist=None):
+        cmd="swaymsg -t get_tree"
+        windows = []
+
+        p = subprocess.Popen(cmd,
+                             shell=True,
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE)
+
+        data = json.loads(p.communicate()[0])
+
+        for output in data['nodes']:
+            if output.get('type') == 'output':
+                workspaces = output.get('nodes')
+                for ws in workspaces:
+                    if ws.get('type') == 'workspace':
+                        windows += self.workspace_nodes(ws)
+
+        if blacklist:
+            windows_whitelist = windows.copy()
+            for win in windows:
+                if win["id"] in blacklist:
+                    windows_whitelist.pop()
+
+            return windows_whitelist
+
+        return windows
+
+
+    # Extracts all windows from sway workspace json
+    def workspace_nodes(self, workspace):
+        windows = []
+
+        floating_nodes = workspace.get('floating_nodes')
+
+        for floating_node in floating_nodes:
+            windows.append(floating_node)
+
+        nodes = workspace.get('nodes')
+
+        for node in nodes:
+            # Leaf node
+            if len(node.get('nodes')) == 0:
+                windows.append(node)
+            # Nested node
+            else:
+                for inner_node in node.get('nodes'):
+                    nodes.append(inner_node)
+
+        return windows
+
+    def active_window():
+        cmd = 'swaymsg -t get_tree) | jq ".. | select(.type?) | select(.focused==true).id"'
+
+
+    async def focus_next_window(self):
+        await asyncio.sleep(random.random() * 3)
+        t = round(time.time() - self.start_time, 1)
+        logging.info("Finished task: {}".format(t))
+
+        if len(self.switching_windows) == 0:
+            self.switching_windows = self.get_windows_whitelist()
+            if len(self.switching_windows) == 0:
+                logging.warning("display: Expected windows to display but there is none")
+
+                return
+
+        next_window = self.switching_windows.pop()
+        logging.info("display: Switching focus to: ".format(next_window["id"]))
+        cmd = "swaymsg [con_id={}] focus".format(next_window["id"])
+
+        p = subprocess.Popen(cmd,
+                             shell=True)
+
+        p.communicate()[0]
+
+    async def task_scheduler(self, interval_s, interval_function):
+        while True:
+            logging.info("Starting periodic function: {}"\
+                         .format(round(time.time() - self.start_time, 1)))
+            await asyncio.gather(
+                asyncio.sleep(interval_s),
+                interval_function(),
+            )
+
+    def switch_workspace(self):
+        cmd = "swaymsg workspace {}".format(next_ws)
+
+        p = subprocess.Popen(cmd,
+                             shell=True,
+                             encoding="utf8")
+
+        res = p.communicate()[0]
+
+    # We determin the application type
+    # and start all applications in their own thread
+    def start_sources(self, urls):
+        download_path = "/tmp/"
+
+        x0 = threading.Thread(target=self.render_sys_view, args=())
+        x0.start()
+        x1 = threading.Thread(target=self.render_image_view, args=("img.jpeg",))
+        x1.start()
+        x2 = threading.Thread(target=self.render_news_view, args=())
+        x2.start()
+
+        for url in urls:
+            if url.endswith(".m3u8"):
+                start_mediaplayer(url)
+                urls.pop(urls.index(url))
+            elif url.endswith(".svg"):
+                download_file(url.strip(), download_path)
+                file = url.split("/")
+                start_image_viewer(download_path + file[-1])
+                urls.pop(urls.index(url))
+
+        x3 = threading.Thread(target=self.start_browser, args=(urls,))
+        x3.start()
+
+    def start_browser(self, urls):
+        cmd = ['webdriver_util.py']
+        for url in urls:
+            cmd.append("--url")
+            cmd.append(url)
+
+        Popen(cmd,
+              env=env,
+              start_new_session=True,
+              close_fds=True,
+              encoding='utf8')
+
+        return True
+
+    def start_image_viewer(self, file):
+        logging.info("Starting image viewer with file: " + file)
+        cmd = [cmds["image_viewer"],  file]
+
+        Popen(cmd,
+              env=env,
+              start_new_session=True,
+              close_fds=True,
+              encoding='utf8')
+
+        return True
+
+    def start_mediaplayer(self, url):
+        cmd = [cmds["media_player"],  url]
+
+        Popen(cmd,
+              env=env,
+              start_new_session=True,
+              close_fds=True,
+              encoding='utf8')
+
+        return True
+
+    def render_sys_view(self):
+        p = System.list_processes()
+        view = Wayland_view(display.res_x, display.res_y)
+        view.s_object["font_size"] = 14
+        view.s_object["alignment"] = "left"
+        self.render_text_view(view, p)
+
+    def render_news_view(self):
+        news = News()
+        item = news.news_item()
+        text = item["title"]
+        logging.debug("News url: " + item["url"])
+        text = item["title"] + "\n" + "[" + item["url"] + "]"
+        view = Wayland_view(display.res_x, display.res_y)
+        self.render_text_view(view, text)
+
+    def render_text_view(self, view, text):
+        view.show_text(text)
+
+    def render_image_view(self, file):
+        view = Wayland_view(display.res_x, display.res_y)
+        view.show_image(file)
 
 
 if __name__ == "__main__":
@@ -369,24 +690,14 @@ if __name__ == "__main__":
     for dep in dependencies:
         if which(dep) is None:
             logging.error("Could not find dependency: " + dep + ", aborting..")
-
-        sys.exit(1)
+            sys.exit(1)
 
     env = os.environ.copy()
 
     if debug:
         for k, v in env.items():
             logging.debug(k + '=' + v)
-
-    try:
-        logging.info(app)
-
-    except Exception as e:
-        logging.error(e)
-        sys.exit(1)
-
-    if debug:
-        logging.debug(list_processes())
+            logging.debug(System.list_processes())
 
     if listen_port < 1025 or listen_port > 65535:
         logging.error("Invalid port, aborting..")
@@ -399,7 +710,12 @@ if __name__ == "__main__":
         sys.exit(1)
 
     hostname = socket.gethostname()
-    local_ip = net_local_iface_address(probe_ip)
+    local_ip = System.net_local_iface_address(probe_ip)
+
+    display = Display()
+    nwins = len(display.get_windows())
+    if nwins > 0:
+        logging.warn("Expected no windows but found {}".format(nwins))
 
     if stream_source == "v4l2":
         # Start streaming
@@ -407,19 +723,18 @@ if __name__ == "__main__":
         stream_create_v4l2_src(stream_source_device)
         logging.info("Setting up stream")
         time.sleep(3)
-        start_browser(urls)
+        display.start_sources(urls)
         stream_v4l2_ffmpeg()
         #gst = stream_setup_gstreamer(stream_source,
         #                             stream_source_device,
         #                             local_ip,
         #                             listen_port)
-        #gst_stream_v4l2src(gst)
         #gst.stdin.close()
         #gst.wait()
 
     elif stream_source == "static-images":
         logging.info("Starting browser with " + str(len(urls)) + "URLs")
-        start_browser(urls)
+        display.start_sources(urls)
 
         gst = stream_setup_gstreamer(stream_source,
                                      stream_source_device,
@@ -432,7 +747,7 @@ if __name__ == "__main__":
 
     elif stream_source == "vnc-browser":
         logging.info("Starting browser")
-        start_browser(urls)
+        display.start_sources(urls)
 
     else:
         logging.error("Missing streaming source configuration. Exiting.")
@@ -474,10 +789,16 @@ if __name__ == "__main__":
         if zeroconf_publish_service and zc:
             zc.unregister_service()
 
+        logging.shutdown()
+
         sys.exit(0)
 
     # Register signal handler
     signal.signal(signal.SIGINT, signal_handler)
+
+    # Change view regularly
+    display.start_time = time.time()
+    asyncio.run(display.task_scheduler(5, display.focus_next_window))
 
     # Start webserver for health endpoints
     app.run(host=listen_address)
