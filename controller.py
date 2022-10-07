@@ -2,9 +2,10 @@
 import requests
 import asyncio
 import configargparse
-from flask import Flask
+from flask import Flask, send_file
 from hnapi import HnApi
 import html
+from icmplib import ping
 import json
 import logging
 import os
@@ -29,9 +30,10 @@ from zeroconf import IPVersion, ServiceInfo, Zeroconf
 wserver = Flask(__name__)
 dependencies = ["xrandr"]
 stream_sources = ["static-images", "v4l2", "vnc-browser"]
-cmds = {"media_player": "mpv",
-        "image_viewer": "imv",
-        "clock": "humanbeans_clock"}
+cmds = {"clock"        : "humanbeans_clock",
+        "image_viewer" : "imv",
+        "media_player" : "mpv",
+        "screenshot"   : "grim"}
 
 @wserver.route("/")
 def info():
@@ -53,11 +55,15 @@ def healthz():
 @wserver.route("/display")
 def display():
     data = {}
-    data['address'] = display.address
+    data["name"] = "display-0"
+    data["os_release"] = "iss-display"
+    data['listen_address'] = display.address
+    data['listen_port'] = display.port
     data['res_x'] = display.res_x
     data['res_y'] = display.res_y
-    data['uptime'] = System.uptime()
     data['playlist'] = playlist.playlist
+    data['streams'] = stream.streams
+    #data['uptime'] = System.uptime()
     json_data = json.dumps(data)
     return json_data
 
@@ -65,6 +71,14 @@ def display():
 def probe_liveness():
     return "OK"
 
+
+@wserver.route("/screenshot")
+def display_screenshot():
+    fn = display.screenshot()
+    if not os.path.isfile(fn):
+        logging.error("screenshot: File {} does not exist".format(fn))
+        return False
+    return send_file(fn, mimetype='image/png')
 
 def which(cmd):
     def is_exe(fpath):
@@ -246,7 +260,7 @@ class Playlist:
             elif item["player"] == "weather":
                 x = threading.Thread(target=self.start_weather_view, args=())
 
-            x.start()
+            #x.start()
             if not x.is_alive():
                 logging.error("Failed to start {}".format(item["player"]))
             else:
@@ -354,6 +368,8 @@ class Playlist:
 class Stream():
 
     def __init__(self, stream_source):
+        self.streams = list()
+
         if stream_source == "v4l2":
             # Start streaming
             logging.info("Setting up source")
@@ -623,14 +639,17 @@ class Wayland_view:
 
 class Display:
 
-    def __init__(self, address):
+    def __init__(self, address, port):
         self.address = address
+        self.port = port
         res = self.get_resolution().split("x")
         self.res_x = int(res[0])
         self.res_y = int(res[1])
         self.start_time = time.time()
         self.switching_windows = list()
         self.window_blacklist = list()
+        self.screenshot_path = "/tmp"
+        self.screenshot_file = "screenshot.png"
 
         logging.info("Resolution: {} x {}"
                      .format(self.res_x, self.res_y))
@@ -779,6 +798,30 @@ class Display:
 
         res = p.communicate()[0]
 
+    def screenshot(self):
+        fn = self.screenshot_path + "/" + self.screenshot_file
+
+        logging.info("Saving screenshot to {}".format(fn))
+        cmd = [cmds["screenshot"],
+               fn]
+
+        p = Popen(cmd,
+                  env=env,
+                  start_new_session=True,
+                  close_fds=True)
+
+        r = p.communicate()[0]
+
+        if r != 0:
+            logging.error("Failed to take screenshot: {}".format(r))
+
+        return fn
+
+
+class Iss:
+
+    def __init__(self, threads):
+        self.threads = threads
 
 
 if __name__ == "__main__":
@@ -951,7 +994,7 @@ if __name__ == "__main__":
     hostname = socket.gethostname()
     local_ip = System.net_local_iface_address(probe_ip)
 
-    display = Display(local_ip)
+    display = Display(local_ip, listen_port)
     nwins = len(display.get_windows())
     if nwins > 0:
         logging.warning("Expected no windows but found {}"
@@ -959,7 +1002,8 @@ if __name__ == "__main__":
 
     playlist = Playlist(uris, 5, location)
     threads = playlist.start_player()
-    logging.info("Started {} sources".format(len(threads)))
+    logging.info("Started {} player".format(len(threads)))
+    iss = Iss(threads)
 
     stream = Stream(stream_source)
 
