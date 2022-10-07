@@ -57,7 +57,7 @@ def display():
     data['res_x'] = display.res_x
     data['res_y'] = display.res_y
     data['uptime'] = System.uptime()
-    data['playlist'] = []
+    data['playlist'] = playlist.playlist
     json_data = json.dumps(data)
     return json_data
 
