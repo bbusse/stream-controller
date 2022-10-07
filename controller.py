@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-
+import requests
 import asyncio
 import configargparse
 from flask import Flask
@@ -26,27 +26,44 @@ from wayland.client import MakeDisplay
 from wayland.utils import AnonymousFile
 from zeroconf import IPVersion, ServiceInfo, Zeroconf
 
-app = Flask(__name__)
+wserver = Flask(__name__)
 dependencies = ["xrandr"]
 stream_sources = ["static-images", "v4l2", "vnc-browser"]
 cmds = {"media_player": "mpv",
-        "image_viewer": "imv"}
+        "image_viewer": "imv",
+        "clock": "humanbeans_clock"}
 
-@app.route("/")
+@wserver.route("/")
 def info():
     return True
 
 
 # Readiness
-@app.route('/healthy')
+@wserver.route('/healthy')
 def healthy():
     return "OK"
 
 
 # Liveness
-@app.route('/healthz')
+@wserver.route('/healthz')
 def healthz():
     return probe_liveness()
+
+
+@wserver.route("/display")
+def display():
+    data = {}
+    data['address'] = display.address
+    data['res_x'] = display.res_x
+    data['res_y'] = display.res_y
+    data['uptime'] = System.uptime()
+    data['playlist'] = []
+    json_data = json.dumps(data)
+    return json_data
+
+
+def probe_liveness():
+    return "OK"
 
 
 def which(cmd):
@@ -66,10 +83,6 @@ def which(cmd):
     return None
 
 
-def probe_liveness():
-    return "OK"
-
-
 def download_file(url, path):
     logging.info("Downloading: " + url)
     cmd = ['curl', '-LO', '--create-dirs', '--output-dir', path,  url]
@@ -83,106 +96,16 @@ def download_file(url, path):
     return True
 
 
-def stream_setup_gstreamer(stream_source, source_device, ip, port):
-    if stream_source == "static-images":
-        gstreamer = subprocess.Popen([
-            'gst-launch-1.0', '-v', '-e',
-            'fdsrc',
-            '!', 'pngdec',
-            '!', 'videoconvert',
-            '!', 'videorate',
-            '!', 'video/x-raw,framerate=25/2',
-            '!', 'theoraenc',
-            '!', 'oggmux',
-            '!', 'tcpserversink', 'host=' + ip + '', 'port=' + str(port) + ''
-            ], stdin=subprocess.PIPE)
-
-    elif stream_source == "v4l2":
-        gstreamer = subprocess.Popen([
-            'gst-launch-1.0', '-v', '-e',
-            'v4l2src', 'device=' + source_device,
-            '!', 'videorate',
-            '!', 'video/x-raw,framerate=25/2',
-            '!', 'queue',
-            '!', 'tcpserversink', 'host=' + ip + '', 'port=' + str(port) + ''
-            ], stdin=subprocess.PIPE)
-
-    return gstreamer
-
-
-def gst_stream_images(gstreamer, img_path, debug=False):
-    t0 = int(round(time.time() * 1000))
-    n = -1
-
-    while True:
-        filename = img_path + '/image_' + str(0).zfill(4) + '.png'
-        t1 = int(round(time.time() * 1000))
-
-        if debug:
-            logging.debug(filename + ": " + str(t1 - t0) + " ms")
-
-        t0 = t1
-
-        f = Path(filename)
-
-        if not f.is_file():
-            logging.info("Startup: No file yet to stream")
-            logging.info("Startup: Waiting..")
-            time.sleep(3)
-        else:
-            if -1 == n:
-                logging.info("Found first file, starting stream")
-                n = 0
-            with open(filename, 'rb') as f:
-                content = f.read()
-                gstreamer.stdin.write(content)
-                time.sleep(0.1)
-
-        if 10 == n:
-            n = 0
-        else:
-            n += 1
-
-
-def stream_create_v4l2_src(device):
-    # Check if device is an existing character device
-    if not stat.S_ISCHR(os.lstat(device)[stat.ST_MODE]):
-        logging.error(device + " does not exist, aborting..")
-        sys.exit(1)
-
-    # Create v4l2 recording of screen
-    logging.info("Creating v4l2 stream with device: " + device)
-    p = subprocess.Popen([
-                'wf-recorder',
-                '--muxer=v4l2',
-                '--file=' + device,
-                ],
-                stdin=subprocess.PIPE,
-                start_new_session=True,
-                close_fds=False,
-                encoding='utf8')
-
-    # Handle wf-recorder prompt for overwriting the file
-    p.stdin.write('Y\n')
-    p.stdin.flush()
-
-    return True
-
-
-def stream_v4l2_ffmpeg():
-    ffmpeg = subprocess.Popen([
-        'ffmpeg', '-f', 'v4l2', '-i', '/dev/video0',
-        '-codec', 'copy',
-        '-f', 'mpegts', 'udp:localhost:6000'
-        ],
-        stdin=subprocess.PIPE,
-        start_new_session=True,
-        close_fds=False)
-
 class System:
 
-    def list_processes():
-        ps = subprocess.Popen(['ps', 'aux'],
+    def list_processes(limit=0):
+        if limit > 0:
+            cmd = ['ps', 'ux', '--ppid', '2', '-p', '2', '--deselect', '|', 'head', '-n', limit]
+        else:
+            cmd = ['ps', 'ux', '--ppid', '2', '-p', '2', '--deselect']
+
+        # Processes without kernel threads
+        ps = subprocess.Popen(cmd,
                               stdout=subprocess.PIPE,
                               encoding="utf8").communicate()[0]
         return ps
@@ -193,6 +116,9 @@ class System:
         s.connect((probe_ip, 80))
 
         return s.getsockname()[0]
+
+    def uptime():
+        return time.time() - psutil.boot_time()
 
 
 class Zeroconf_service:
@@ -236,6 +162,317 @@ class Zeroconf_service:
         return True
 
 
+class Playlist:
+
+    def __init__(self, uris, default_play_time_s, location=None):
+        self.download_path = "/tmp/"
+        self.location = location
+        self.default_play_time_s = default_play_time_s
+        self.news = None
+
+        self.playlist = list()
+        self.playlist = self.create(uris)
+
+    def create(self, uris):
+        n = 0
+        playlist = list()
+
+        for uri in uris:
+            item = {}
+            n += 1
+            if uri.endswith(".m3u8"):
+                item["num"] = n
+                item["uri"] = uri
+                item["player"] = "mediaplayer"
+                item["play_time_s"] = self.default_play_time_s
+            elif uri.endswith(".svg"):
+                download_file(uri.strip(), download_path)
+                file = uri.split("/")
+                item["num"] = n
+                item["uri"] = "file:///" + download_path + file[-1]
+                item["player"] = "imageviewer"
+                item["play_time_s"] = self.default_play_time_s
+            elif uri.startswith("https://"):
+                item["num"] = n
+                item["uri"] = uri
+                item["player"] = "browser"
+                item["play_time_s"] = self.default_play_time_s
+            elif uri.startswith("iss-clock://"):
+                item["num"] = n
+                item["uri"] = uri
+                item["player"] = "clock"
+                item["play_time_s"] = self.default_play_time_s
+            elif uri.startswith("iss-news://"):
+                self.news = News()
+                item["num"] = n
+                item["uri"] = uri
+                item["player"] = "news"
+                item["play_time_s"] = self.default_play_time_s
+            elif uri.startswith("iss-system://"):
+                item["num"] = n
+                item["uri"] = uri
+                item["player"] = "system"
+                item["play_time_s"] = self.default_play_time_s
+            elif uri.startswith("iss-weather://"):
+                weather = Weather(self.location)
+                item["num"] = n
+                item["uri"] = uri
+                item["player"] = "weather"
+                item["play_time_s"] = self.default_play_time_s
+
+            # Append if we found a valid playlist item
+            if "num" in item:
+                playlist.append(item)
+
+        return playlist
+
+    def start_player(self):
+        threads = list()
+        for item in self.playlist:
+            if item["player"] == "browser":
+                # start_browser() wants a list
+                # but we want to start an instance for each URL
+                urls = list()
+                urls.append(item["uri"])
+                x = threading.Thread(target=self.start_browser, args=(urls,))
+            elif item["player"] == "clock":
+                x = threading.Thread(target=self.start_clock, args=())
+            elif item["player"] == "imageviewer":
+                x = threading.Thread(target=self.start_image_view, args=())
+            elif item["player"] == "news":
+                x = threading.Thread(target=self.start_news_view, args=(self.news,))
+            elif item["system"] == "system":
+                x = threading.Thread(target=self.start_system_view, args=())
+            elif item["player"] == "weather":
+                x = threading.Thread(target=self.start_weather_view, args=())
+
+            x.start()
+            if not x.is_alive():
+                logging.error("Failed to start {}".format(item["player"]))
+            else:
+                threads.append(x)
+
+        return threads
+
+    def start_browser(self, urls):
+        cmd = ['webdriver_util.py']
+        for url in urls:
+            cmd.append("--url")
+            cmd.append(url)
+
+        Popen(cmd,
+              env=env,
+              start_new_session=True,
+              close_fds=True,
+              encoding='utf8')
+
+        return True
+
+    def start_clock(self):
+        logging.info("Starting clock")
+        cmd = [cmds["clock"]]
+
+        p = Popen(cmd,
+                  env=env,
+                  start_new_session=True,
+                  close_fds=True)
+
+        if p.communicate()[0] != 0:
+            return False
+
+        return True
+
+    def start_image_viewer(self, file):
+        logging.info("Starting image viewer with file: " + file)
+        cmd = [cmds["image_viewer"],  file]
+
+        Popen(cmd,
+              env=env,
+              start_new_session=True,
+              close_fds=True,
+              encoding='utf8')
+
+        return True
+
+    def start_mediaplayer(self, url):
+        logging.info("Starting media player with stream: " + url)
+        cmd = [cmds["media_player"],  url]
+
+        Popen(cmd,
+              env=env,
+              start_new_session=True,
+              close_fds=True,
+              encoding='utf8')
+
+        return True
+
+    def start_sys_view(self):
+        texts = list()
+        texts.append(System.list_processes(23))
+        view = Wayland_view(display.res_x, display.res_y, len(texts))
+        view.s_objects[0]["font_size"] = 14
+        view.s_objects[0]["alignment"] = "left"
+        self.render_text_view(view, texts)
+
+    def start_weather_view(self, weather):
+        texts = list()
+        data = weather.current_weather()
+        texts.append(data["current_condition"][0]["temp_C"] + "°C")
+        texts.append(data["current_condition"][0]["weatherDesc"][0]["value"] + " " +  \
+                     data["current_condition"][0]["windspeedKmph"] + " km/h")
+        texts.append(data["nearest_area"][0]["areaName"][0]["value"])
+        view = Wayland_view(display.res_x, display.res_y, len(texts))
+        view.s_objects[0]["font_size"] = 80
+        view.s_objects[0]["alignment"] = "left"
+        view.s_objects[1]["font_size"] = 40
+        view.s_objects[1]["alignment"] = "left"
+        view.s_objects[2]["font_size"] = 20
+        view.s_objects[2]["alignment"] = "left"
+        self.render_text_view(view, texts)
+
+    def start_news_view(self, news):
+        texts = list()
+        item = news.news_item()
+        texts.append("[HN]")
+        texts.append(item["title"])
+        texts.append(item["url"])
+        logging.info("News: " + item["url"])
+        view = Wayland_view(display.res_x, display.res_y, len(texts))
+        view.s_objects[0]["font_size"] = 30
+        view.s_objects[1]["font_size"] = 60
+        view.s_objects[2]["font_size"] = 30
+        self.render_text_view(view, texts)
+
+    def render_text_view(self, view, texts):
+        view.show_text(texts)
+
+    def start_image_view(self, view, files):
+        view = Wayland_view(display.res_x, display.res_y)
+        view.show_image(file)
+
+
+class Stream():
+
+    def __init__(self, stream_source):
+        if stream_source == "v4l2":
+            # Start streaming
+            logging.info("Setting up source")
+            stream_create_v4l2_src(stream_source_device)
+            logging.info("Setting up stream")
+            time.sleep(3)
+            stream_v4l2_ffmpeg()
+            #gst = stream_setup_gstreamer(stream_source,
+            #                             stream_source_device,
+            #                             local_ip,
+            #                             listen_port)
+            #gst.stdin.close()
+            #gst.wait()
+
+        elif stream_source == "static-images":
+            gst = stream_setup_gstreamer(stream_source,
+                                         stream_source_device,
+                                         local_ip,
+                                         listen_port)
+
+            gst_stream_images(gst, img_path)
+            gst.stdin.close()
+            gst.wait()
+
+    def stream_setup_gstreamer(stream_source, source_device, ip, port):
+        if stream_source == "static-images":
+            gstreamer = subprocess.Popen([
+                'gst-launch-1.0', '-v', '-e',
+                'fdsrc',
+                '!', 'pngdec',
+                '!', 'videoconvert',
+                '!', 'videorate',
+                '!', 'video/x-raw,framerate=25/2',
+                '!', 'theoraenc',
+                '!', 'oggmux',
+                '!', 'tcpserversink', 'host=' + ip + '', 'port=' + str(port) + ''
+                ], stdin=subprocess.PIPE)
+
+        elif stream_source == "v4l2":
+            gstreamer = subprocess.Popen([
+                'gst-launch-1.0', '-v', '-e',
+                'v4l2src', 'device=' + source_device,
+                '!', 'videorate',
+                '!', 'video/x-raw,framerate=25/2',
+                '!', 'queue',
+                '!', 'tcpserversink', 'host=' + ip + '', 'port=' + str(port) + ''
+                ], stdin=subprocess.PIPE)
+
+        return gstreamer
+
+    def gst_stream_images(gstreamer, img_path, debug=False):
+        t0 = int(round(time.time() * 1000))
+        n = -1
+
+        while True:
+            filename = img_path + '/image_' + str(0).zfill(4) + '.png'
+            t1 = int(round(time.time() * 1000))
+
+            if debug:
+                logging.debug(filename + ": " + str(t1 - t0) + " ms")
+
+            t0 = t1
+
+            f = Path(filename)
+
+            if not f.is_file():
+                logging.info("Startup: No file yet to stream")
+                logging.info("Startup: Waiting..")
+                time.sleep(3)
+            else:
+                if -1 == n:
+                    logging.info("Found first file, starting stream")
+                    n = 0
+                with open(filename, 'rb') as f:
+                    content = f.read()
+                    gstreamer.stdin.write(content)
+                    time.sleep(0.1)
+
+            if 10 == n:
+                n = 0
+            else:
+                n += 1
+
+    def stream_create_v4l2_src(device):
+        # Check if device is an existing character device
+        if not stat.S_ISCHR(os.lstat(device)[stat.ST_MODE]):
+            logging.error(device + " does not exist, aborting..")
+            sys.exit(1)
+
+        # Create v4l2 recording of screen
+        logging.info("Creating v4l2 stream with device: " + device)
+        p = subprocess.Popen([
+                    'wf-recorder',
+                    '--muxer=v4l2',
+                    '--file=' + device,
+                    ],
+                    stdin=subprocess.PIPE,
+                    start_new_session=True,
+                    close_fds=False,
+                    encoding='utf8')
+
+        # Handle wf-recorder prompt for overwriting the file
+        p.stdin.write('Y\n')
+        p.stdin.flush()
+
+        return True
+
+
+    def stream_v4l2_ffmpeg():
+        ffmpeg = subprocess.Popen([
+            'ffmpeg', '-f', 'v4l2', '-i', '/dev/video0',
+            '-codec', 'copy',
+            '-f', 'mpegts', 'udp:localhost:6000'
+            ],
+            stdin=subprocess.PIPE,
+            start_new_session=True,
+            close_fds=False)
+
+
 class News:
 
     def __init__(self):
@@ -268,9 +505,48 @@ class News:
         return n
 
 
+class Weather:
+
+    def __init__(self, location):
+        self.location = location
+        self.weather = self.fetch_weather()
+
+    def fetch_weather(self):
+        url = "https://wttr.in/{}?format=j1".format(self.location)
+        logging.info("Fetching weather for {} at {}"\
+                     .format(self.location, url))
+
+        cmd = ['curl ' + url]
+        p = subprocess.Popen(cmd,
+                             shell=True,
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT,
+                             encoding="utf8")
+
+        #data = p.communicate()[0]
+        data = requests.get(url, timeout=10)
+        data = data.content
+
+        if not data:
+            logging.error("Failed to fetch weather data")
+
+        try:
+            data = json.loads(data)
+        except ValueError as e:
+            logging.error("weather: Failed to decode data")
+            logging.error(e)
+            data = {}
+            sys.exit(1)
+
+        return data
+
+    def current_weather(self):
+        return self.weather
+
+
 class Wayland_view:
 
-    def __init__(self, res_x, res_y):
+    def __init__(self, res_x, res_y, num_objects):
         # Load the main Wayland protocol.
         wp_base = wayland.protocol.Protocol("/usr/share/wayland/wayland.xml")
         wp_xdg_shell = wayland.protocol.Protocol("/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml")
@@ -289,36 +565,26 @@ class Wayland_view:
         self.window["res_y"] = res_y
         self.window["title"] = "News"
 
-        self.s_object = {"alignment": "center",
-                         "offset_x": 10,
-                         "offset_y": 10,
-                         "bg_colour_r": 7,
-                         "bg_colour_g": 59,
-                         "bg_colour_b": 76,
-                         "font_face": "monospace",
-                         "font_size": 60,
-                         "font_colour_r": 0,
-                         "font_colour_g": 0,
-                         "font_colour_b": 0,
-                         "file": "",
-                         "text": ""}
+        s_object = {"alignment": "center",
+                    "offset_x": 10,
+                    "offset_y": 10,
+                    "bg_colour_r": 7,
+                    "bg_colour_g": 59,
+                    "bg_colour_b": 76,
+                    "font_face": "monospace",
+                    "font_size": 60,
+                    "font_colour_r": 0,
+                    "font_colour_g": 0,
+                    "font_colour_b": 0,
+                    "file": "",
+                    "text": list()}
 
-    def show_text(self, text, fullscreen=False):
-        self.s_object["text"] = html.escape(text)
-        w = view.Window(self.conn,
-                        self.window,
-                        self.s_object,
-                        redraw=view.draw_text_in_window,
-                        fullscreen=fullscreen)
+        self.s_objects = list()
+        for n in range(0, num_objects):
+            logging.info("view: Appending drawing object")
+            self.s_objects.append(s_object.copy())
 
-    def show_image(self, file, fullscreen=False):
-        self.s_object["file"] = file
-        w = view.Window(self.conn,
-                        self.window,
-                        self.s_object,
-                        redraw=view.draw_img_in_window,
-                        fullscreen=fullscreen)
-
+    def create_window(self, w):
         view.eventloop()
 
         w.close()
@@ -326,10 +592,39 @@ class Wayland_view:
         self.conn.disconnect()
         logging.info("Exiting wayland view: {}".format(view.shutdowncode))
 
+    def show_text(self, texts, fullscreen=False):
+        logging.info("view: Have {} text blocks".format(len(texts)))
+        n = 0
+        for text in texts:
+            logging.info(text)
+            self.s_objects[n]["text"] = html.escape(text)
+            n += 1
+
+        w = view.Window(self.conn,
+                        self.window,
+                        self.s_objects,
+                        redraw=view.draw_text_in_window,
+                        fullscreen=fullscreen,
+                        class_="iss-view")
+
+        self.create_window(w)
+
+    def show_image(self, file, fullscreen=False):
+        self.s_object["file"] = file
+        w = view.Window(self.conn,
+                        self.window,
+                        self.s_object,
+                        redraw=iew.draw_img_in_window,
+                        fullscreen=fullscreen,
+                        class_="iss-view")
+
+        self.create_window(w)
+
 
 class Display:
 
-    def __init__(self):
+    def __init__(self, address):
+        self.address = address
         res = self.get_resolution().split("x")
         self.res_x = int(res[0])
         self.res_y = int(res[1])
@@ -423,7 +718,6 @@ class Display:
     def active_window():
         cmd = 'swaymsg -t get_tree) | jq ".. | select(.type?) | select(.focused==true).id"'
 
-
     async def focus_next_window(self):
         await asyncio.sleep(random.random() * 3)
         t = round(time.time() - self.start_time, 1)
@@ -439,6 +733,28 @@ class Display:
         next_window = self.switching_windows.pop()
         logging.info("display: Switching focus to: ".format(next_window["id"]))
         cmd = "swaymsg [con_id={}] focus".format(next_window["id"])
+
+        p = subprocess.Popen(cmd,
+                             shell=True)
+
+        p.communicate()[0]
+
+    async def fullscreen_next_window(self):
+        await asyncio.sleep(random.random() * 3)
+        t = round(time.time() - self.start_time, 1)
+        logging.info("Finished task: {}".format(t))
+
+        if len(self.switching_windows) == 0:
+            self.switching_windows = self.get_windows_whitelist()
+            if len(self.switching_windows) == 0:
+                logging.warning("display: Expected windows to display but there is none")
+
+                return
+
+        next_window = self.switching_windows.pop()
+        logging.info("display: Switching focus to: ".format(next_window["id"]))
+
+        cmd = "swaymsg [con_id={}] fullscreen".format(next_window["id"])
 
         p = subprocess.Popen(cmd,
                              shell=True)
@@ -463,90 +779,6 @@ class Display:
 
         res = p.communicate()[0]
 
-    # We determin the application type
-    # and start all applications in their own thread
-    def start_sources(self, urls):
-        download_path = "/tmp/"
-
-        x0 = threading.Thread(target=self.render_sys_view, args=())
-        x0.start()
-        x1 = threading.Thread(target=self.render_image_view, args=("img.jpeg",))
-        x1.start()
-        x2 = threading.Thread(target=self.render_news_view, args=())
-        x2.start()
-
-        for url in urls:
-            if url.endswith(".m3u8"):
-                start_mediaplayer(url)
-                urls.pop(urls.index(url))
-            elif url.endswith(".svg"):
-                download_file(url.strip(), download_path)
-                file = url.split("/")
-                start_image_viewer(download_path + file[-1])
-                urls.pop(urls.index(url))
-
-        x3 = threading.Thread(target=self.start_browser, args=(urls,))
-        x3.start()
-
-    def start_browser(self, urls):
-        cmd = ['webdriver_util.py']
-        for url in urls:
-            cmd.append("--url")
-            cmd.append(url)
-
-        Popen(cmd,
-              env=env,
-              start_new_session=True,
-              close_fds=True,
-              encoding='utf8')
-
-        return True
-
-    def start_image_viewer(self, file):
-        logging.info("Starting image viewer with file: " + file)
-        cmd = [cmds["image_viewer"],  file]
-
-        Popen(cmd,
-              env=env,
-              start_new_session=True,
-              close_fds=True,
-              encoding='utf8')
-
-        return True
-
-    def start_mediaplayer(self, url):
-        cmd = [cmds["media_player"],  url]
-
-        Popen(cmd,
-              env=env,
-              start_new_session=True,
-              close_fds=True,
-              encoding='utf8')
-
-        return True
-
-    def render_sys_view(self):
-        p = System.list_processes()
-        view = Wayland_view(display.res_x, display.res_y)
-        view.s_object["font_size"] = 14
-        view.s_object["alignment"] = "left"
-        self.render_text_view(view, p)
-
-    def render_news_view(self):
-        news = News()
-        item = news.news_item()
-        text = item["title"]
-        logging.debug("News url: " + item["url"])
-        text = item["title"] + "\n" + "[" + item["url"] + "]"
-        view = Wayland_view(display.res_x, display.res_y)
-        self.render_text_view(view, text)
-
-    def render_text_view(self, view, text):
-        view.show_text(text)
-
-    def render_image_view(self, file):
-        view = Wayland_view(display.res_x, display.res_y)
-        view.show_image(file)
 
 
 if __name__ == "__main__":
@@ -558,8 +790,8 @@ if __name__ == "__main__":
                         help="Show debug output",
                         type=bool,
                         default=False)
-    parser.add_argument('--url',
-                        dest='urls',
+    parser.add_argument('--uri',
+                        dest='uris',
                         env_var='URL',
                         help="The URL to open in a browser, can be supplied multiple times",
                         type=str,
@@ -595,6 +827,12 @@ if __name__ == "__main__":
                         help="Path to image files",
                         type=str,
                         default="/tmp/screenshots/")
+    parser.add_argument('--location',
+                        dest='location',
+                        env_var='LOCATION',
+                        help="The location to gather data like weather for",
+                        type=str,
+                        default="Berlin")
     parser.add_argument('--logfile',
                         dest='logfile',
                         env_var='LOGFILE',
@@ -634,19 +872,20 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     # workaround: Make url a new list if first element contains a '|'
-    # since we can specify --url multiple times but not URL as
-    # an env var. We use pipe: | as seperator since it is not allow in URLs
-    if args.urls[0].find("|") != -1:
-        args.urls = args.urls[0].split("|")
+    # since we can specify --uri multiple times but not URI as
+    # an env var. We use pipe: | as seperator since it is not allowed in URIs
+    if args.uris[0].find("|") != -1:
+        args.uris = args.uris[0].split("|")
 
     debug = args.debug
-    urls = args.urls
+    uris = args.uris
     stream_source = args.stream_source
     stream_source_device = args.stream_source_device
     img_path = args.img_path
     listen_address = args.listen_address
     listen_port = args.listen_port
     probe_ip = args.probe_ip
+    location = args.location
     zeroconf_publish_service = args.zeroconf_publish_service
     zc_service_name_prefix = args.zeroconf_service_name_prefix
     zc_service_type = args.zeroconf_service_type
@@ -712,53 +951,24 @@ if __name__ == "__main__":
     hostname = socket.gethostname()
     local_ip = System.net_local_iface_address(probe_ip)
 
-    display = Display()
+    display = Display(local_ip)
     nwins = len(display.get_windows())
     if nwins > 0:
-        logging.warn("Expected no windows but found {}".format(nwins))
+        logging.warning("Expected no windows but found {}"
+                        .format(nwins))
 
-    if stream_source == "v4l2":
-        # Start streaming
-        logging.info("Setting up source")
-        stream_create_v4l2_src(stream_source_device)
-        logging.info("Setting up stream")
-        time.sleep(3)
-        display.start_sources(urls)
-        stream_v4l2_ffmpeg()
-        #gst = stream_setup_gstreamer(stream_source,
-        #                             stream_source_device,
-        #                             local_ip,
-        #                             listen_port)
-        #gst.stdin.close()
-        #gst.wait()
+    playlist = Playlist(uris, 5, location)
+    threads = playlist.start_player()
+    logging.info("Started {} sources".format(len(threads)))
 
-    elif stream_source == "static-images":
-        logging.info("Starting browser with " + str(len(urls)) + "URLs")
-        display.start_sources(urls)
-
-        gst = stream_setup_gstreamer(stream_source,
-                                     stream_source_device,
-                                     local_ip,
-                                     listen_port)
-
-        gst_stream_images(gst, img_path)
-        gst.stdin.close()
-        gst.wait()
-
-    elif stream_source == "vnc-browser":
-        logging.info("Starting browser")
-        display.start_sources(urls)
-
-    else:
-        logging.error("Missing streaming source configuration. Exiting.")
-        sys.exit(1)
+    stream = Stream(stream_source)
 
     # Publish service on the network via mDNS
     if zeroconf_publish_service:
         zc_listen_address = listen_address
 
         if "0.0.0.0" == zc_listen_address:
-            zc_listen_address = net_local_iface_address(probe_ip)
+            zc_listen_address = System.net_local_iface_address(probe_ip)
 
         zc_listen_port = listen_port
 
@@ -787,7 +997,7 @@ if __name__ == "__main__":
 
         # Unpublish service
         if zeroconf_publish_service and zc:
-            zc.unregister_service()
+            zc.zc_unregister_service()
 
         logging.shutdown()
 
@@ -798,7 +1008,7 @@ if __name__ == "__main__":
 
     # Change view regularly
     display.start_time = time.time()
-    asyncio.run(display.task_scheduler(5, display.focus_next_window))
+    #asyncio.run(display.task_scheduler(5, display.fullscreen_next_window))
 
-    # Start webserver for health endpoints
-    app.run(host=listen_address)
+    # Start webserver
+    wserver.run(host=listen_address)
