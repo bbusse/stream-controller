@@ -1,7 +1,6 @@
 configargparse >= 1.2.3
 Flask >= 1.1.2
 hntop >= 0.0.10
-psutil >= 5.9.2
 requests >= 2.28.1
 selenium >= 4.4.3
 zeroconf >= 0.3.9
