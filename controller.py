@@ -5,12 +5,10 @@ import configargparse
 from flask import Flask, send_file
 from hnapi import HnApi
 import html
-from icmplib import ping
 import json
 import logging
 import os
 from pathlib import Path
-import psutil
 import random
 import socket
 import stat
@@ -62,6 +60,7 @@ def display():
     data['res_x'] = display.res_x
     data['res_y'] = display.res_y
     data['playlist'] = playlist.playlist
+    data['uris'] = playlist.uris
     data['streams'] = stream.streams
     #data['uptime'] = System.uptime()
     json_data = json.dumps(data)
@@ -132,7 +131,8 @@ class System:
         return s.getsockname()[0]
 
     def uptime():
-        return time.time() - psutil.boot_time()
+        #return time.time() - psutil.boot_time()
+        return False
 
 
 class Zeroconf_service:
@@ -186,6 +186,7 @@ class Playlist:
 
         self.playlist = list()
         self.playlist = self.create(uris)
+        self.uris = self.get_uris()
 
     def create(self, uris):
         n = 0
@@ -239,6 +240,12 @@ class Playlist:
                 playlist.append(item)
 
         return playlist
+
+    def get_uris(self):
+        for item in self.playlist:
+            uris.append(item["uri"])
+
+        return uris
 
     def start_player(self):
         threads = list()
@@ -809,11 +816,6 @@ class Display:
                   env=env,
                   start_new_session=True,
                   close_fds=True)
-
-        r = p.communicate()[0]
-
-        if r != 0:
-            logging.error("Failed to take screenshot: {}".format(r))
 
         return fn
 
