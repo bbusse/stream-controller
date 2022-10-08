@@ -26,7 +26,7 @@ from wayland.utils import AnonymousFile
 from zeroconf import IPVersion, ServiceInfo, Zeroconf
 
 wserver = Flask(__name__)
-dependencies = ["xrandr"]
+dependencies = []
 stream_sources = ["static-images", "v4l2", "vnc-browser"]
 cmds = {"clock"        : "humanbeans_clock",
         "image_viewer" : "imv",
@@ -201,10 +201,10 @@ class Playlist:
                 item["player"] = "mediaplayer"
                 item["play_time_s"] = self.default_play_time_s
             elif uri.endswith(".svg"):
-                download_file(uri.strip(), download_path)
+                download_file(uri.strip(), self.download_path)
                 file = uri.split("/")
                 item["num"] = n
-                item["uri"] = "file:///" + download_path + file[-1]
+                item["uri"] = "file:///" + self.download_path + file[-1]
                 item["player"] = "imageviewer"
                 item["play_time_s"] = self.default_play_time_s
             elif uri.startswith("https://"):
@@ -646,12 +646,12 @@ class Wayland_view:
 
 class Display:
 
-    def __init__(self, address, port):
+    def __init__(self, address, port, res_x=1280, res_y=1024):
         self.address = address
         self.port = port
-        res = self.get_resolution().split("x")
-        self.res_x = int(res[0])
-        self.res_y = int(res[1])
+        logging.info("Resolution: {}x{}".format(res_x, res_y))
+        self.res_x = res_x
+        self.res_y = res_y
         self.start_time = time.time()
         self.switching_windows = list()
         self.window_blacklist = list()
@@ -668,21 +668,6 @@ class Display:
             self.window_blacklist.append(win["id"])
 
         logging.info("Blacklisted {} windows".format(len(self.window_blacklist)))
-
-    def get_resolution(self):
-        cmd = "xrandr -q | awk '/\*/ {print $1}' \
-               | awk 'BEGIN{FS=\"x\";} NR==1 || \
-               $1>max {line=$0; max=$1}; END {print line}'"
-
-        p = subprocess.Popen(cmd,
-                             shell=True,
-                             stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE,
-                             encoding="utf8")
-
-        res = p.communicate()[0]
-
-        return res
 
     def get_windows_whitelist(self):
         windows = self.get_windows(self.window_blacklist)
@@ -837,8 +822,8 @@ if __name__ == "__main__":
                         default=False)
     parser.add_argument('--uri',
                         dest='uris',
-                        env_var='URL',
-                        help="The URL to open in a browser, can be supplied multiple times",
+                        env_var='URI',
+                        help="The URIs to open, can be supplied multiple times",
                         type=str,
                         action='append',
                         required=True)
