@@ -8,4 +8,4 @@ pangocairocffi >= 0.7.0
 Pillow >= 9.2.0
 selenium >= 4.4.3
 xkbcommon >= 0.4
-zeroconf >= 0.3.9
+git+https://github.com/bbusse/python-zeroconf@workaround-1088#egg=zeroconf
