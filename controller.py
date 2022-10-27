@@ -28,6 +28,7 @@ from zeroconf import IPVersion, ServiceInfo, Zeroconf
 wserver = Flask(__name__)
 dependencies = []
 stream_sources = ["static-images", "v4l2", "vnc-browser"]
+sway_socket_path = "/tmp/sway.sock"
 cmds = {"clock"        : "humanbeans_clock",
         "image_viewer" : "imv",
         "media_player" : "mpv",
@@ -76,7 +77,7 @@ def display_screenshot():
     fn = display.screenshot()
     if not os.path.isfile(fn):
         logging.error("screenshot: File {} does not exist".format(fn))
-        return False
+        #return False
     return send_file(fn, mimetype='image/png')
 
 def which(cmd):
@@ -380,11 +381,11 @@ class Stream():
         if stream_source == "v4l2":
             # Start streaming
             logging.info("Setting up source")
-            stream_create_v4l2_src(stream_source_device)
+            self.stream_create_v4l2_src(stream_source_device)
             logging.info("Setting up stream")
             time.sleep(3)
-            stream_v4l2_ffmpeg()
-            #gst = stream_setup_gstreamer(stream_source,
+            self.stream_v4l2_ffmpeg()
+            #gst = self.stream_setup_gstreamer(stream_source,
             #                             stream_source_device,
             #                             local_ip,
             #                             listen_port)
@@ -392,16 +393,16 @@ class Stream():
             #gst.wait()
 
         elif stream_source == "static-images":
-            gst = stream_setup_gstreamer(stream_source,
+            gst = self.stream_setup_gstreamer(stream_source,
                                          stream_source_device,
                                          local_ip,
                                          listen_port)
 
-            gst_stream_images(gst, img_path)
+            self.gst_stream_images(gst, img_path)
             gst.stdin.close()
             gst.wait()
 
-    def stream_setup_gstreamer(stream_source, source_device, ip, port):
+    def stream_setup_gstreamer(self, stream_source, source_device, ip, port):
         if stream_source == "static-images":
             gstreamer = subprocess.Popen([
                 'gst-launch-1.0', '-v', '-e',
@@ -427,16 +428,16 @@ class Stream():
 
         return gstreamer
 
-    def gst_stream_images(gstreamer, img_path, debug=False):
+    def gst_stream_images(self, gstreamer, img_path, debug=False):
         t0 = int(round(time.time() * 1000))
         n = -1
 
         while True:
-            filename = img_path + '/image_' + str(0).zfill(4) + '.png'
+            #filename = img_path + '/image_' + str(0).zfill(4) + '.png'
+            filename = '/tmp/screenshot.png'
             t1 = int(round(time.time() * 1000))
 
-            if debug:
-                logging.debug(filename + ": " + str(t1 - t0) + " ms")
+            logging.debug(filename + ": " + str(t1 - t0) + " ms")
 
             t0 = t1
 
@@ -460,7 +461,7 @@ class Stream():
             else:
                 n += 1
 
-    def stream_create_v4l2_src(device):
+    def stream_create_v4l2_src(self, device):
         # Check if device is an existing character device
         if not stat.S_ISCHR(os.lstat(device)[stat.ST_MODE]):
             logging.error(device + " does not exist, aborting..")
@@ -484,16 +485,12 @@ class Stream():
 
         return True
 
-
-    def stream_v4l2_ffmpeg():
+    def stream_v4l2_ffmpeg(self):
         ffmpeg = subprocess.Popen([
             'ffmpeg', '-f', 'v4l2', '-i', '/dev/video0',
             '-codec', 'copy',
-            '-f', 'mpegts', 'udp:localhost:6000'
-            ],
-            stdin=subprocess.PIPE,
-            start_new_session=True,
-            close_fds=False)
+            '-f', 'mpegts', 'udp:0.0.0.0:6000'
+            ])
 
 
 class News:
@@ -676,7 +673,7 @@ class Display:
         return windows
 
     def get_windows(self, blacklist=None):
-        cmd="swaymsg -t get_tree"
+        cmd="swaymsg -s {} -t get_tree".format(sway_socket_path)
         windows = []
 
         p = subprocess.Popen(cmd,
@@ -727,7 +724,7 @@ class Display:
         return windows
 
     def active_window():
-        cmd = 'swaymsg -t get_tree) | jq ".. | select(.type?) | select(.focused==true).id"'
+        cmd = 'swaymsg -s {} -t get_tree) | jq ".. | select(.type?) | select(.focused==true).id"'.format(sway_socket_path)
 
     async def focus_next_window(self):
         await asyncio.sleep(random.random() * 3)
@@ -743,7 +740,7 @@ class Display:
 
         next_window = self.switching_windows.pop()
         logging.info("display: Switching focus to: ".format(next_window["id"]))
-        cmd = "swaymsg [con_id={}] focus".format(next_window["id"])
+        cmd = "swaymsg -s sway_socket_path [con_id={}] focus".format(next_window["id"], sway_socket_path)
 
         p = subprocess.Popen(cmd,
                              shell=True)
@@ -765,7 +762,7 @@ class Display:
         next_window = self.switching_windows.pop()
         logging.info("display: Switching focus to: ".format(next_window["id"]))
 
-        cmd = "swaymsg [con_id={}] fullscreen".format(next_window["id"])
+        cmd = "swaymsg -s sway_socket_path [con_id={}] fullscreen".format(next_window["id"], sway_socket_path)
 
         p = subprocess.Popen(cmd,
                              shell=True)
@@ -782,7 +779,7 @@ class Display:
             )
 
     def switch_workspace(self):
-        cmd = "swaymsg workspace {}".format(next_ws)
+        cmd = "swaymsg -s sway_socket_path workspace {}".format(next_ws, sway_socket_path)
 
         p = subprocess.Popen(cmd,
                              shell=True,
@@ -976,7 +973,7 @@ if __name__ == "__main__":
         sources_str = " ".join(str(x) for x in stream_sources)
         logging.error("Invalid source, aborting..")
         logging.info("Possible choices are: " + sources_str)
-        sys.exit(1)
+        #sys.exit(1)
 
     hostname = socket.gethostname()
     local_ip = System.net_local_iface_address(probe_ip)
