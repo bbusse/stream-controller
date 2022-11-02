@@ -28,7 +28,6 @@ from zeroconf import IPVersion, ServiceInfo, Zeroconf
 wserver = Flask(__name__)
 dependencies = []
 stream_sources = ["static-images", "v4l2", "vnc-browser"]
-sway_socket_path = "/tmp/sway.sock"
 cmds = {"clock"        : "humanbeans_clock",
         "image_viewer" : "imv",
         "media_player" : "mpv",
@@ -230,7 +229,7 @@ class Playlist:
                 item["player"] = "system"
                 item["play_time_s"] = self.default_play_time_s
             elif uri.startswith("iss-weather://"):
-                weather = Weather(self.location)
+                self.weather = Weather(self.location)
                 item["num"] = n
                 item["uri"] = uri
                 item["player"] = "weather"
@@ -263,12 +262,12 @@ class Playlist:
                 x = threading.Thread(target=self.start_image_view, args=())
             elif item["player"] == "news":
                 x = threading.Thread(target=self.start_news_view, args=(self.news,))
-            elif item["system"] == "system":
+            elif item["player"] == "system":
                 x = threading.Thread(target=self.start_system_view, args=())
             elif item["player"] == "weather":
-                x = threading.Thread(target=self.start_weather_view, args=())
+                x = threading.Thread(target=self.start_weather_view, args=(self.weather,))
 
-            #x.start()
+            x.start()
             if not x.is_alive():
                 logging.error("Failed to start {}".format(item["player"]))
             else:
@@ -544,8 +543,11 @@ class Weather:
                              encoding="utf8")
 
         #data = p.communicate()[0]
-        data = requests.get(url, timeout=10)
-        data = data.content
+        try:
+            data = requests.get(url, timeout=10)
+            data = data.content
+        except ReadTimeout as e:
+            logging.error("weather: Timeout for request")
 
         if not data:
             logging.error("Failed to fetch weather data")
@@ -654,6 +656,7 @@ class Display:
         self.window_blacklist = list()
         self.screenshot_path = "/tmp"
         self.screenshot_file = "screenshot.png"
+        self.socket_path = self.get_socket_path()
 
         logging.info("Resolution: {} x {}"
                      .format(self.res_x, self.res_y))
@@ -666,6 +669,22 @@ class Display:
 
         logging.info("Blacklisted {} windows".format(len(self.window_blacklist)))
 
+        self.x = threading.Thread(target=self.focus_next_window, args=())
+        self.x.start()
+
+    def get_socket_path(self):
+        cmd = ['/usr/bin/sway', '--get-socketpath']
+        p = subprocess.Popen(cmd,
+                             shell=False,
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT,
+                             encoding="utf8")
+
+        path = p.communicate()
+        path = path[0].rstrip()
+        #path = "/tmp/sway.sock"
+        return path
+
     def get_windows_whitelist(self):
         windows = self.get_windows(self.window_blacklist)
         logging.info("display: {} windows in whitelist".format(len(windows)))
@@ -673,7 +692,7 @@ class Display:
         return windows
 
     def get_windows(self, blacklist=None):
-        cmd="swaymsg -s {} -t get_tree".format(sway_socket_path)
+        cmd="swaymsg -s {} -t get_tree".format(self.socket_path)
         windows = []
 
         p = subprocess.Popen(cmd,
@@ -724,28 +743,25 @@ class Display:
         return windows
 
     def active_window():
-        cmd = 'swaymsg -s {} -t get_tree) | jq ".. | select(.type?) | select(.focused==true).id"'.format(sway_socket_path)
+        cmd = 'swaymsg -s {} -t get_tree) | jq ".. | select(.type?) | select(.focused==true).id"'.format(self.socket_path)
 
-    async def focus_next_window(self):
-        await asyncio.sleep(random.random() * 3)
-        t = round(time.time() - self.start_time, 1)
-        logging.info("Finished task: {}".format(t))
-
-        if len(self.switching_windows) == 0:
-            self.switching_windows = self.get_windows_whitelist()
+    def focus_next_window(self):
+        while True:
+            logging.info("Focus change {}".format(self.switching_windows))
+            time.sleep(3)
             if len(self.switching_windows) == 0:
-                logging.warning("display: Expected windows to display but there is none")
+                self.switching_windows = self.get_windows_whitelist()
+                if len(self.switching_windows) == 0:
+                    logging.warning("display: Expected windows to display but there is none")
 
-                return
+                    continue
 
-        next_window = self.switching_windows.pop()
-        logging.info("display: Switching focus to: ".format(next_window["id"]))
-        cmd = "swaymsg -s sway_socket_path [con_id={}] focus".format(next_window["id"], sway_socket_path)
+            next_window = self.switching_windows.pop()
+            logging.info("display: Switching focus to: ".format(next_window["id"]))
+            cmd = "swaymsg -s {} [con_id={}] focus".format(self.socket_path, next_window["id"])
+            p = subprocess.Popen(cmd, shell=True)
+            p.communicate()[0]
 
-        p = subprocess.Popen(cmd,
-                             shell=True)
-
-        p.communicate()[0]
 
     async def fullscreen_next_window(self):
         await asyncio.sleep(random.random() * 3)
@@ -762,7 +778,7 @@ class Display:
         next_window = self.switching_windows.pop()
         logging.info("display: Switching focus to: ".format(next_window["id"]))
 
-        cmd = "swaymsg -s sway_socket_path [con_id={}] fullscreen".format(next_window["id"], sway_socket_path)
+        cmd = "swaymsg -s {} [con_id={}] fullscreen".format(self.socket_path, next_window["id"])
 
         p = subprocess.Popen(cmd,
                              shell=True)
@@ -779,7 +795,7 @@ class Display:
             )
 
     def switch_workspace(self):
-        cmd = "swaymsg -s sway_socket_path workspace {}".format(next_ws, sway_socket_path)
+        cmd = "swaymsg -s {} workspace {}".format(self.socket_path, next_ws)
 
         p = subprocess.Popen(cmd,
                              shell=True,
@@ -979,6 +995,7 @@ if __name__ == "__main__":
     local_ip = System.net_local_iface_address(probe_ip)
 
     display = Display(local_ip, listen_port)
+
     nwins = len(display.get_windows())
     if nwins > 0:
         logging.warning("Expected no windows but found {}"
