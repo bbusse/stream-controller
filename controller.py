@@ -176,13 +176,24 @@ class Zeroconf_service:
         return True
 
 
+class Theme:
+
+    def __init__(self, name="default"):
+        self.name = name
+        self.img_bg = "background.jpg"
+        self.font = ""
+        self.font_face = "Monospace"
+
+
 class Playlist:
 
-    def __init__(self, uris, default_play_time_s, location=None):
+    def __init__(self, uris, default_play_time_s, theme, location=None):
         self.download_path = "/tmp/"
         self.location = location
         self.default_play_time_s = default_play_time_s
         self.news = None
+        self.theme = theme
+        self.img_bg = "themes/" + theme.name + "/background.jpg"
 
         self.playlist = list()
         self.playlist = self.create(uris)
@@ -199,13 +210,6 @@ class Playlist:
                 item["num"] = n
                 item["uri"] = uri
                 item["player"] = "mediaplayer"
-                item["play_time_s"] = self.default_play_time_s
-            elif uri.endswith(".svg"):
-                download_file(uri.strip(), self.download_path)
-                file = uri.split("/")
-                item["num"] = n
-                item["uri"] = "file:///" + self.download_path + file[-1]
-                item["player"] = "imageviewer"
                 item["play_time_s"] = self.default_play_time_s
             elif uri.startswith("https://"):
                 item["num"] = n
@@ -234,6 +238,18 @@ class Playlist:
                 item["uri"] = uri
                 item["player"] = "weather"
                 item["play_time_s"] = self.default_play_time_s
+            elif uri.endswith(".svg"):
+                download_file(uri.strip(), self.download_path)
+                file = uri.split("/")
+                item["num"] = n
+                item["uri"] = "file:///" + self.download_path + file[-1]
+                item["player"] = "imageviewer"
+                item["play_time_s"] = self.default_play_time_s
+            elif uri.endswith(".jpg"):
+                item["num"] = n
+                item["uri"] = uri
+                item["player"] = "imageviewer"
+                item["play_time_s"] = self.default_play_time_s
 
             # Append if we found a valid playlist item
             if "num" in item:
@@ -259,13 +275,13 @@ class Playlist:
             elif item["player"] == "clock":
                 x = threading.Thread(target=self.start_clock, args=())
             elif item["player"] == "imageviewer":
-                x = threading.Thread(target=self.start_image_view, args=())
+                x = threading.Thread(target=self.start_image_view, args=(item["uri"],))
             elif item["player"] == "news":
-                x = threading.Thread(target=self.start_news_view, args=(self.news,))
+                x = threading.Thread(target=self.start_news_view, args=(self.news, self.img_bg))
             elif item["player"] == "system":
                 x = threading.Thread(target=self.start_system_view, args=())
             elif item["player"] == "weather":
-                x = threading.Thread(target=self.start_weather_view, args=(self.weather,))
+                x = threading.Thread(target=self.start_weather_view, args=(self.weather, self.img_bg))
 
             x.start()
             if not x.is_alive():
@@ -330,45 +346,42 @@ class Playlist:
     def start_sys_view(self):
         texts = list()
         texts.append(System.list_processes(23))
-        view = Wayland_view(display.res_x, display.res_y, len(texts))
+        view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
         view.s_objects[0]["font_size"] = 14
         view.s_objects[0]["alignment"] = "left"
-        self.render_text_view(view, texts)
+        view.show_text(texts)
 
-    def start_weather_view(self, weather):
+    def start_weather_view(self, weather, img_bg):
         texts = list()
         data = weather.current_weather()
         texts.append(data["current_condition"][0]["temp_C"] + "°C")
         texts.append(data["current_condition"][0]["weatherDesc"][0]["value"] + " " +  \
                      data["current_condition"][0]["windspeedKmph"] + " km/h")
         texts.append(data["nearest_area"][0]["areaName"][0]["value"])
-        view = Wayland_view(display.res_x, display.res_y, len(texts))
+        view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
         view.s_objects[0]["font_size"] = 80
         view.s_objects[0]["alignment"] = "left"
         view.s_objects[1]["font_size"] = 40
         view.s_objects[1]["alignment"] = "left"
         view.s_objects[2]["font_size"] = 20
         view.s_objects[2]["alignment"] = "left"
-        self.render_text_view(view, texts)
+        view.show_text(texts, img_bg)
 
-    def start_news_view(self, news):
+    def start_news_view(self, news, img_bg):
         texts = list()
         item = news.news_item()
         texts.append("[HN]")
         texts.append(item["title"])
         texts.append(item["url"])
         logging.info("News: " + item["url"])
-        view = Wayland_view(display.res_x, display.res_y, len(texts))
+        view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
         view.s_objects[0]["font_size"] = 30
         view.s_objects[1]["font_size"] = 60
         view.s_objects[2]["font_size"] = 30
-        self.render_text_view(view, texts)
+        view.show_text(texts, img_bg)
 
-    def render_text_view(self, view, texts):
-        view.show_text(texts)
-
-    def start_image_view(self, view, files):
-        view = Wayland_view(display.res_x, display.res_y)
+    def start_image_view(self, file):
+        view = Wayland_view(display.res_x, display.res_y, 1, theme)
         view.show_image(file)
 
 
@@ -518,8 +531,9 @@ class News:
         n = {"title": "",
              "url": ""}
 
-        n["title"] = self.news.pop(0).get('title')
-        n["url"] = self.news.pop(0).get('url')
+        n["title"] = self.news[0].get('title')
+        n["url"] = self.news[0].get('url')
+        self.news.pop(0)
 
         return n
 
@@ -568,7 +582,7 @@ class Weather:
 
 class Wayland_view:
 
-    def __init__(self, res_x, res_y, num_objects):
+    def __init__(self, res_x, res_y, num_objects, theme):
         # Load the main Wayland protocol.
         wp_base = wayland.protocol.Protocol("/usr/share/wayland/wayland.xml")
         wp_xdg_shell = wayland.protocol.Protocol("/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml")
@@ -590,10 +604,12 @@ class Wayland_view:
         s_object = {"alignment": "center",
                     "offset_x": 10,
                     "offset_y": 10,
+                    "bg_alpha": 1,
                     "bg_colour_r": 7,
                     "bg_colour_g": 59,
                     "bg_colour_b": 76,
-                    "font_face": "monospace",
+                    "font": theme.font,
+                    "font_face": theme.font_face,
                     "font_size": 60,
                     "font_colour_r": 0,
                     "font_colour_g": 0,
@@ -614,29 +630,34 @@ class Wayland_view:
         self.conn.disconnect()
         logging.info("Exiting wayland view: {}".format(view.shutdowncode))
 
-    def show_text(self, texts, fullscreen=False):
+    def show_text(self, texts, img_bg=False, fullscreen=False):
+        if img_bg:
+            self.s_objects[0]["file"] = img_bg
+
         logging.info("view: Have {} text blocks".format(len(texts)))
+
         n = 0
         for text in texts:
-            logging.info(text)
+            logging.debug(text)
             self.s_objects[n]["text"] = html.escape(text)
             n += 1
 
         w = view.Window(self.conn,
                         self.window,
                         self.s_objects,
-                        redraw=view.draw_text_in_window,
+                        redraw=view.draw_img_with_text,
                         fullscreen=fullscreen,
                         class_="iss-view")
 
         self.create_window(w)
 
-    def show_image(self, file, fullscreen=False):
-        self.s_object["file"] = file
+    def show_image(self, img_file, fullscreen=False):
+        self.s_objects[0]["file"] = file
+        self.s_objects[0]["bg_alpha"] = 0
         w = view.Window(self.conn,
                         self.window,
-                        self.s_object,
-                        redraw=iew.draw_img_in_window,
+                        self.s_objects,
+                        redraw=view.draw_img_with_text,
                         fullscreen=fullscreen,
                         class_="iss-view")
 
@@ -669,7 +690,7 @@ class Display:
 
         logging.info("Blacklisted {} windows".format(len(self.window_blacklist)))
 
-        self.x = threading.Thread(target=self.focus_next_window, args=())
+        self.x = threading.Thread(target=self.focus_next_window, args=(3,))
         self.x.start()
 
     def get_socket_path(self):
@@ -745,10 +766,9 @@ class Display:
     def active_window():
         cmd = 'swaymsg -s {} -t get_tree) | jq ".. | select(.type?) | select(.focused==true).id"'.format(self.socket_path)
 
-    def focus_next_window(self):
+    def focus_next_window(self, t_focus_s):
         while True:
-            logging.info("Focus change {}".format(self.switching_windows))
-            time.sleep(3)
+            time.sleep(t_focus_s)
             if len(self.switching_windows) == 0:
                 self.switching_windows = self.get_windows_whitelist()
                 if len(self.switching_windows) == 0:
@@ -893,6 +913,12 @@ if __name__ == "__main__":
                         help="The address to probe for",
                         type=str,
                         default="9.9.9.9")
+    parser.add_argument('--theme',
+                        dest='theme_name',
+                        env_var='THEME',
+                        help="The theme to use",
+                        type=str,
+                        default="default")
     parser.add_argument('--zeroconf-publish-service',
                         dest='zeroconf_publish_service',
                         env_var='ZEROCONF_PUBLISH',
@@ -927,8 +953,9 @@ if __name__ == "__main__":
     img_path = args.img_path
     listen_address = args.listen_address
     listen_port = args.listen_port
-    probe_ip = args.probe_ip
     location = args.location
+    probe_ip = args.probe_ip
+    theme_name = args.theme_name
     zeroconf_publish_service = args.zeroconf_publish_service
     zc_service_name_prefix = args.zeroconf_service_name_prefix
     zc_service_type = args.zeroconf_service_type
@@ -992,7 +1019,13 @@ if __name__ == "__main__":
         #sys.exit(1)
 
     hostname = socket.gethostname()
-    local_ip = System.net_local_iface_address(probe_ip)
+    local_ip = ""
+
+    try:
+        local_ip = System.net_local_iface_address(probe_ip)
+    except:
+        logging.error("No network connection")
+        exit(1)
 
     display = Display(local_ip, listen_port)
 
@@ -1001,7 +1034,8 @@ if __name__ == "__main__":
         logging.warning("Expected no windows but found {}"
                         .format(nwins))
 
-    playlist = Playlist(uris, 5, location)
+    theme = Theme(theme_name)
+    playlist = Playlist(uris, 5, theme, location)
     threads = playlist.start_player()
     logging.info("Started {} player".format(len(threads)))
     iss = Iss(threads)
