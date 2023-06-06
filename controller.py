@@ -8,6 +8,7 @@ import html
 import json
 import logging
 import os
+from paho.mqtt import client as mqtt_client
 from pathlib import Path
 import random
 import socket
@@ -18,20 +19,19 @@ import signal
 import sys
 import time
 import threading
+from zeroconf import IPVersion, ServiceInfo, Zeroconf
 sys.path.append(os.path.abspath("/usr/local/src/python-wayland"))
 import draw as view
 import wayland.protocol
-from wayland.client import MakeDisplay
-from wayland.utils import AnonymousFile
-from zeroconf import IPVersion, ServiceInfo, Zeroconf
 
 wserver = Flask(__name__)
 dependencies = []
 stream_sources = ["static-images", "v4l2", "vnc-browser"]
-cmds = {"clock"        : "humanbeans_clock",
-        "image_viewer" : "imv",
-        "media_player" : "mpv",
-        "screenshot"   : "grim"}
+cmds = {"clock":        "humanbeans_clock",
+        "image_viewer": "imv",
+        "media_player": "mpv",
+        "screenshot":   "grim"}
+
 
 @wserver.route("/")
 def info():
@@ -50,8 +50,8 @@ def healthz():
     return probe_liveness()
 
 
-@wserver.route("/display")
-def display():
+@wserver.route("/screen")
+def screen():
     data = {}
     data["name"] = "display-0"
     data["os_release"] = "iss-display"
@@ -78,6 +78,7 @@ def display_screenshot():
         logging.error("screenshot: File {} does not exist".format(fn))
         #return False
     return send_file(fn, mimetype='image/png')
+
 
 def which(cmd):
     def is_exe(fpath):
@@ -112,17 +113,14 @@ def download_file(url, path):
 class System:
 
     def list_processes(limit=0):
-        if limit > 0:
-            cmd = ['ps', 'ux', '--ppid', '2', '-p', '2', '--deselect', '|', 'head', '-n', limit]
-        else:
-            cmd = ['ps', 'ux', '--ppid', '2', '-p', '2', '--deselect']
+        cmd = ['ps', 'ux', '--ppid', '2', '-p', '2', '--deselect']
 
         # Processes without kernel threads
         ps = subprocess.Popen(cmd,
                               stdout=subprocess.PIPE,
+                              shell=False,
                               encoding="utf8").communicate()[0]
         return ps
-
 
     def net_local_iface_address(probe_ip):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -171,7 +169,7 @@ class Zeroconf_service:
 
     def zc_unregister_service(self):
         self.zc.unregister_service(self.zc_service)
-        zc.close()
+        self.zc.close()
 
         return True
 
@@ -180,20 +178,26 @@ class Theme:
 
     def __init__(self, name="default"):
         self.name = name
-        self.img_bg = "background.jpg"
+        self.img_bg = "themes/" + self.name + "/background.jpg"
         self.font = ""
         self.font_face = "Monospace"
 
 
 class Playlist:
 
-    def __init__(self, uris, default_play_time_s, theme, location=None):
+    def __init__(self,
+                 uris,
+                 default_play_time_s,
+                 theme,
+                 topics,
+                 location=None):
+
         self.download_path = "/tmp/"
         self.location = location
         self.default_play_time_s = default_play_time_s
         self.news = None
         self.theme = theme
-        self.img_bg = "themes/" + theme.name + "/background.jpg"
+        self.topics = topics
 
         self.playlist = list()
         self.playlist = self.create(uris)
@@ -220,6 +224,11 @@ class Playlist:
                 item["num"] = n
                 item["uri"] = uri
                 item["player"] = "clock"
+                item["play_time_s"] = self.default_play_time_s
+            elif uri.startswith("iss-mqtt://"):
+                item["num"] = n
+                item["uri"] = uri
+                item["player"] = "mqtt"
                 item["play_time_s"] = self.default_play_time_s
             elif uri.startswith("iss-news://"):
                 self.news = News()
@@ -271,17 +280,29 @@ class Playlist:
                 # but we want to start an instance for each URL
                 urls = list()
                 urls.append(item["uri"])
-                x = threading.Thread(target=self.start_browser, args=(urls,))
+                x = threading.Thread(target=self.start_browser,
+                                     args=(urls,))
             elif item["player"] == "clock":
-                x = threading.Thread(target=self.start_clock, args=())
+                x = threading.Thread(target=self.start_clock,
+                                     args=())
             elif item["player"] == "imageviewer":
-                x = threading.Thread(target=self.start_image_view, args=(item["uri"],))
+                x = threading.Thread(target=self.start_image_view,
+                                     args=(item["uri"],))
+            elif item["player"] == "mqtt":
+                x = threading.Thread(target=self.start_mqtt_views,
+                                     args=(self.topics,
+                                           self.theme,))
             elif item["player"] == "news":
-                x = threading.Thread(target=self.start_news_view, args=(self.news, self.img_bg))
+                x = threading.Thread(target=self.start_news_view,
+                                     args=(self.news,
+                                           self.theme.img_bg,))
             elif item["player"] == "system":
-                x = threading.Thread(target=self.start_system_view, args=())
+                x = threading.Thread(target=self.start_sys_view,
+                                     args=(self.theme.img_bg,))
             elif item["player"] == "weather":
-                x = threading.Thread(target=self.start_weather_view, args=(self.weather, self.img_bg))
+                x = threading.Thread(target=self.start_weather_view,
+                                     args=(self.weather,
+                                           self.theme.img_bg,))
 
             x.start()
             if not x.is_alive():
@@ -331,6 +352,25 @@ class Playlist:
 
         return True
 
+    def start_mqtt_views(self, topics, theme):
+        mqtt_client_id = "iss-display-42"
+        mqtt = MQTT(mqtt_broker,
+                    mqtt_client_id,
+                    mqtt_port,
+                    mqtt_user,
+                    mqtt_pw)
+        try:
+            mqttc = mqtt.connect()
+        except Exception:
+            logging.info("MQTT: Failed to connect")
+            return False
+
+        for topic in topics:
+            mqtt.subscribe(mqttc, topic, theme)
+            logging.info("MQTT: Subscribed to {}".format(topic))
+
+        mqttc.loop_forever()
+
     def start_mediaplayer(self, url):
         logging.info("Starting media player with stream: " + url)
         cmd = [cmds["media_player"],  url]
@@ -343,19 +383,20 @@ class Playlist:
 
         return True
 
-    def start_sys_view(self):
+    def start_sys_view(self, img_bg):
         texts = list()
         texts.append(System.list_processes(23))
         view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
         view.s_objects[0]["font_size"] = 14
         view.s_objects[0]["alignment"] = "left"
-        view.show_text(texts)
+        view.show_text(texts, img_bg)
 
     def start_weather_view(self, weather, img_bg):
         texts = list()
         data = weather.current_weather()
         texts.append(data["current_condition"][0]["temp_C"] + "°C")
-        texts.append(data["current_condition"][0]["weatherDesc"][0]["value"] + " " +  \
+        texts.append(data["current_condition"][0]["weatherDesc"][0]["value"]
+                     + " " +
                      data["current_condition"][0]["windspeedKmph"] + " km/h")
         texts.append(data["nearest_area"][0]["areaName"][0]["value"])
         view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
@@ -406,9 +447,9 @@ class Stream():
 
         elif stream_source == "static-images":
             gst = self.stream_setup_gstreamer(stream_source,
-                                         stream_source_device,
-                                         local_ip,
-                                         listen_port)
+                                              stream_source_device,
+                                              local_ip,
+                                              listen_port)
 
             self.gst_stream_images(gst, img_path)
             gst.stdin.close()
@@ -425,7 +466,8 @@ class Stream():
                 '!', 'video/x-raw,framerate=25/2',
                 '!', 'theoraenc',
                 '!', 'oggmux',
-                '!', 'tcpserversink', 'host=' + ip + '', 'port=' + str(port) + ''
+                '!', 'tcpserversink', 'host=' + ip + '',
+                'port=' + str(port) + ''
                 ], stdin=subprocess.PIPE)
 
         elif stream_source == "v4l2":
@@ -435,7 +477,8 @@ class Stream():
                 '!', 'videorate',
                 '!', 'video/x-raw,framerate=25/2',
                 '!', 'queue',
-                '!', 'tcpserversink', 'host=' + ip + '', 'port=' + str(port) + ''
+                '!', 'tcpserversink', 'host=' + ip + '',
+                'port=' + str(port) + ''
                 ], stdin=subprocess.PIPE)
 
         return gstreamer
@@ -505,6 +548,66 @@ class Stream():
             ])
 
 
+class MQTT:
+
+    def __init__(self, broker, client_id, port=1883, user="", pw=""):
+        self.client_id = client_id
+        self.broker = broker
+        self.port = port
+        self.user = user
+        self.pw = pw
+        self.mqtt_views = list()
+
+    def connect(self):
+        def on_connect(client, userdata, flags, r):
+            if r == 0:
+                logging.info("MQTT: Connected")
+            else:
+                logging.error("MQTT: Failed to connect: %d\n", r)
+
+        # Set client ID
+        client = mqtt_client.Client(self.client_id)
+
+        if self.user != "" and self.pw != "":
+            client.username_pw_set(self.user, self.pw)
+
+        client.on_connect = on_connect
+        client.connect(self.broker, self.port)
+        return client
+
+    def subscribe(self, client: mqtt_client, topic, theme):
+        self.theme = theme
+
+        def on_message(client, userdata, msg):
+            self.active_msg = ""
+            jm = msg.payload.decode()
+            m = json.loads(jm)
+            logging.info(f"Received `{m}` in  `{msg.topic}`")
+            texts = list()
+
+            if msg.topic == "hyperblast/current_song":
+                texts.append(m["title"])
+                texts.append("[" + m["file"] + "]")
+            elif msg.topic == "sensor/mainhallsensor/temperature":
+                texts.append("Mainhall")
+                texts.append(str(m) + " °C")
+
+            view = Wayland_view(display.res_x,
+                                display.res_y,
+                                len(texts),
+                                self.theme)
+
+            view.s_objects[0]["font_size"] = 64
+            view.s_objects[0]["alignment"] = "center"
+            view.s_objects[1]["font_size"] = 48
+            view.s_objects[1]["alignment"] = "center"
+            view.show_text(texts, theme.img_bg)
+            self.mqtt_views.append(msg.topic)
+
+        client.subscribe(topic)
+        client.on_message = on_message
+
+
 class News:
 
     def __init__(self):
@@ -546,7 +649,7 @@ class Weather:
 
     def fetch_weather(self):
         url = "https://wttr.in/{}?format=j1".format(self.location)
-        logging.info("Fetching weather for {} at {}"\
+        logging.info("Fetching weather for {} at {}"
                      .format(self.location, url))
 
         cmd = ['curl ' + url]
@@ -560,8 +663,11 @@ class Weather:
         try:
             data = requests.get(url, timeout=10)
             data = data.content
-        except ReadTimeout as e:
-            logging.error("weather: Timeout for request")
+        except requests.ReadTimeout as e:
+            logging.error("weather: Timeout for request {}"
+                          .format(e))
+        except Exception:
+            logging.error("weather: Error requesting weather")
 
         if not data:
             logging.error("Failed to fetch weather data")
@@ -585,7 +691,8 @@ class Wayland_view:
     def __init__(self, res_x, res_y, num_objects, theme):
         # Load the main Wayland protocol.
         wp_base = wayland.protocol.Protocol("/usr/share/wayland/wayland.xml")
-        wp_xdg_shell = wayland.protocol.Protocol("/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml")
+        wp_xdg_shell = wayland.protocol.Protocol(
+            "/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml")
 
         try:
             self.conn = view.WaylandConnection(wp_base, wp_xdg_shell)
@@ -615,6 +722,7 @@ class Wayland_view:
                     "font_colour_g": 0,
                     "font_colour_b": 0,
                     "file": "",
+                    "img_scale_up": True,
                     "text": list()}
 
         self.s_objects = list()
@@ -645,19 +753,20 @@ class Wayland_view:
         w = view.Window(self.conn,
                         self.window,
                         self.s_objects,
-                        redraw=view.draw_img_with_text,
+                        redraw=view.draw_image_with_text,
                         fullscreen=fullscreen,
                         class_="iss-view")
 
         self.create_window(w)
 
     def show_image(self, img_file, fullscreen=False):
-        self.s_objects[0]["file"] = file
+        self.s_objects[0]["texts"] = list()
+        self.s_objects[0]["file"] = img_file
         self.s_objects[0]["bg_alpha"] = 0
         w = view.Window(self.conn,
                         self.window,
                         self.s_objects,
-                        redraw=view.draw_img_with_text,
+                        redraw=view.draw_image_with_text,
                         fullscreen=fullscreen,
                         class_="iss-view")
 
@@ -666,7 +775,7 @@ class Wayland_view:
 
 class Display:
 
-    def __init__(self, address, port, res_x=1280, res_y=1024):
+    def __init__(self, address, port, res_x=1366, res_y=768):
         self.address = address
         self.port = port
         logging.info("Resolution: {}x{}".format(res_x, res_y))
@@ -688,7 +797,8 @@ class Display:
         for win in existing_windows:
             self.window_blacklist.append(win["id"])
 
-        logging.info("Blacklisted {} windows".format(len(self.window_blacklist)))
+        logging.info("Blacklisted {} windows"
+                     .format(len(self.window_blacklist)))
 
         self.x = threading.Thread(target=self.focus_next_window, args=(3,))
         self.x.start()
@@ -713,7 +823,7 @@ class Display:
         return windows
 
     def get_windows(self, blacklist=None):
-        cmd="swaymsg -s {} -t get_tree".format(self.socket_path)
+        cmd = "swaymsg -s {} -t get_tree".format(self.socket_path)
         windows = []
 
         p = subprocess.Popen(cmd,
@@ -740,7 +850,6 @@ class Display:
 
         return windows
 
-
     # Extracts all windows from sway workspace json
     def workspace_nodes(self, workspace):
         windows = []
@@ -763,8 +872,10 @@ class Display:
 
         return windows
 
-    def active_window():
-        cmd = 'swaymsg -s {} -t get_tree) | jq ".. | select(.type?) | select(.focused==true).id"'.format(self.socket_path)
+    def active_window(self):
+        cmd = 'swaymsg -s {} -t get_tree) | jq ".. | select(.type?) | \
+               select(.focused==true).id"'\
+               .format(self.socket_path)
 
     def focus_next_window(self, t_focus_s):
         while True:
@@ -772,16 +883,18 @@ class Display:
             if len(self.switching_windows) == 0:
                 self.switching_windows = self.get_windows_whitelist()
                 if len(self.switching_windows) == 0:
-                    logging.warning("display: Expected windows to display but there is none")
+                    logging.warning("display: Expected windows to display \
+                                    but there is none")
 
                     continue
 
             next_window = self.switching_windows.pop()
-            logging.info("display: Switching focus to: ".format(next_window["id"]))
-            cmd = "swaymsg -s {} [con_id={}] focus".format(self.socket_path, next_window["id"])
+            logging.info("display: Switching focus to: {}"
+                         .format(next_window["id"]))
+            cmd = "swaymsg -s {} [con_id={}] focus"\
+                  .format(self.socket_path, next_window["id"])
             p = subprocess.Popen(cmd, shell=True)
             p.communicate()[0]
-
 
     async def fullscreen_next_window(self):
         await asyncio.sleep(random.random() * 3)
@@ -791,14 +904,17 @@ class Display:
         if len(self.switching_windows) == 0:
             self.switching_windows = self.get_windows_whitelist()
             if len(self.switching_windows) == 0:
-                logging.warning("display: Expected windows to display but there is none")
+                logging.warning("display: Expected windows to display \
+                                but there is none")
 
                 return
 
         next_window = self.switching_windows.pop()
-        logging.info("display: Switching focus to: ".format(next_window["id"]))
+        logging.info("display: Switching focus to: {}"
+                     .format(next_window["id"]))
 
-        cmd = "swaymsg -s {} [con_id={}] fullscreen".format(self.socket_path, next_window["id"])
+        cmd = "swaymsg -s {} [con_id={}] fullscreen"\
+              .format(self.socket_path, next_window["id"])
 
         p = subprocess.Popen(cmd,
                              shell=True)
@@ -807,15 +923,15 @@ class Display:
 
     async def task_scheduler(self, interval_s, interval_function):
         while True:
-            logging.info("Starting periodic function: {}"\
+            logging.info("Starting periodic function: {}"
                          .format(round(time.time() - self.start_time, 1)))
             await asyncio.gather(
                 asyncio.sleep(interval_s),
                 interval_function(),
             )
 
-    def switch_workspace(self):
-        cmd = "swaymsg -s {} workspace {}".format(self.socket_path, next_ws)
+    def switch_workspace(self, ws):
+        cmd = "swaymsg -s {} workspace {}".format(self.socket_path, ws)
 
         p = subprocess.Popen(cmd,
                              shell=True,
@@ -856,7 +972,7 @@ if __name__ == "__main__":
     parser.add_argument('--uri',
                         dest='uris',
                         env_var='URI',
-                        help="The URIs to open, can be supplied multiple times",
+                        help="The URIs to open, can be used multiple times",
                         type=str,
                         action='append',
                         required=True)
@@ -907,6 +1023,36 @@ if __name__ == "__main__":
                         help="Loglevel, default: INFO",
                         type=str,
                         default='INFO')
+    parser.add_argument('--mqtt-broker',
+                        dest='mqtt_broker',
+                        env_var='MQTT_BROKER',
+                        help="The MQTT broker address",
+                        type=str,
+                        default="")
+    parser.add_argument('--mqtt-port',
+                        dest='mqtt_port',
+                        env_var='MQTT_PORT',
+                        help="The MQTT port",
+                        type=int,
+                        default=1883)
+    parser.add_argument('--mqtt-user',
+                        dest='mqtt_user',
+                        env_var='MQTT_USER',
+                        help="The MQTT user",
+                        type=str,
+                        default="")
+    parser.add_argument('--mqtt-password',
+                        dest='mqtt_pw',
+                        env_var='MQTT_PASSWORD',
+                        help="The MQTT password",
+                        type=str,
+                        default="")
+    parser.add_argument('--mqtt-topics',
+                        dest='mqtt_topics',
+                        env_var='MQTT_TOPICS',
+                        help="The MQTT topics to subscribe to",
+                        type=str,
+                        action='append')
     parser.add_argument('--probe-ip',
                         dest='probe_ip',
                         env_var='PROBE_IP',
@@ -938,13 +1084,15 @@ if __name__ == "__main__":
                         type=str,
                         default="_http._tcp.local.")
 
-
     args = parser.parse_args()
     # workaround: Make url a new list if first element contains a '|'
     # since we can specify --uri multiple times but not URI as
     # an env var. We use pipe: | as seperator since it is not allowed in URIs
     if args.uris[0].find("|") != -1:
         args.uris = args.uris[0].split("|")
+    # Same for MQTT topics
+    if args.mqtt_topics[0].find("|") != -1:
+        args.mqtt_topics[0] = args.mqtt_topics[0].split("|")
 
     debug = args.debug
     uris = args.uris
@@ -954,6 +1102,11 @@ if __name__ == "__main__":
     listen_address = args.listen_address
     listen_port = args.listen_port
     location = args.location
+    mqtt_broker = args.mqtt_broker
+    mqtt_port = args.mqtt_port
+    mqtt_user = args.mqtt_user
+    mqtt_pw = args.mqtt_pw
+    mqtt_topics = args.mqtt_topics
     probe_ip = args.probe_ip
     theme_name = args.theme_name
     zeroconf_publish_service = args.zeroconf_publish_service
@@ -1023,7 +1176,7 @@ if __name__ == "__main__":
 
     try:
         local_ip = System.net_local_iface_address(probe_ip)
-    except:
+    except Exception:
         logging.error("No network connection")
         exit(1)
 
@@ -1035,7 +1188,8 @@ if __name__ == "__main__":
                         .format(nwins))
 
     theme = Theme(theme_name)
-    playlist = Playlist(uris, 5, theme, location)
+    logging.info("Using theme: {}".format(theme_name))
+    playlist = Playlist(uris, 5, theme, mqtt_topics, location)
     threads = playlist.start_player()
     logging.info("Started {} player".format(len(threads)))
     iss = Iss(threads)
@@ -1051,10 +1205,10 @@ if __name__ == "__main__":
 
         zc_listen_port = listen_port
 
-        logging.info("zeroconf: Publishing service of type " \
-            + zc_service_type + " with name prefix " \
-            + zc_service_name_prefix + " on " \
-            + zc_listen_address + ":" + str(zc_listen_port))
+        logging.info("zeroconf: Publishing service of type "
+                     + zc_service_type + " with name prefix "
+                     + zc_service_name_prefix + " on "
+                     + zc_listen_address + ":" + str(zc_listen_port))
 
         zc_service_properties = {"stream_source": stream_source}
 
@@ -1078,6 +1232,10 @@ if __name__ == "__main__":
         if zeroconf_publish_service and zc:
             zc.zc_unregister_service()
 
+        for thread in threads:
+            logging.info("Stopping thread")
+            #thread.join()
+
         logging.shutdown()
 
         sys.exit(0)
@@ -1087,7 +1245,6 @@ if __name__ == "__main__":
 
     # Change view regularly
     display.start_time = time.time()
-    #asyncio.run(display.task_scheduler(5, display.fullscreen_next_window))
 
     # Start webserver
     wserver.run(host=listen_address)
