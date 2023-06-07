@@ -113,9 +113,12 @@ def download_file(url, path):
 class System:
 
     def list_processes(limit=0):
+        # Processes without kernel threads
         cmd = ['ps', 'ux', '--ppid', '2', '-p', '2', '--deselect']
 
-        # Processes without kernel threads
+        # FreeBSD
+        cmd = ['ps', 'ux']
+
         ps = subprocess.Popen(cmd,
                               stdout=subprocess.PIPE,
                               shell=False,
@@ -690,9 +693,23 @@ class Wayland_view:
 
     def __init__(self, res_x, res_y, num_objects, theme):
         # Load the main Wayland protocol.
-        wp_base = wayland.protocol.Protocol("/usr/share/wayland/wayland.xml")
-        wp_xdg_shell = wayland.protocol.Protocol(
-            "/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml")
+        if os.path.isfile("/usr/share/wayland/wayland.xml"):
+            wp_base = wayland.protocol.Protocol("/usr/share/wayland/wayland.xml")
+        elif os.path.isfile("/usr/local/share/wayland/wayland.xml"):
+            wp_base = wayland.protocol.Protocol("/usr/local/share/wayland/wayland.xml")
+        else:
+            logging.error("wayland: Failed to find wayland protocol xml")
+            sys.exit(1)
+
+        if os.path.isfile("/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml"):
+            wp_xdg_shell = wayland.protocol.Protocol(
+                "/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml")
+        elif os.path.isfile("/usr/local/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml"):
+            wp_xdg_shell = wayland.protocol.Protocol(
+                "/usr/local/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml")
+        else:
+            logging.error("wayland: Failed to find wayland protocol shell xml")
+            sys.exit(1)
 
         try:
             self.conn = view.WaylandConnection(wp_base, wp_xdg_shell)
@@ -804,7 +821,7 @@ class Display:
         self.x.start()
 
     def get_socket_path(self):
-        cmd = ['/usr/bin/sway', '--get-socketpath']
+        cmd = ['/usr/local/bin/sway', '--get-socketpath']
         p = subprocess.Popen(cmd,
                              shell=False,
                              stdout=subprocess.PIPE,
@@ -1178,7 +1195,7 @@ if __name__ == "__main__":
         local_ip = System.net_local_iface_address(probe_ip)
     except Exception:
         logging.error("No network connection")
-        exit(1)
+        #exit(1)
 
     display = Display(local_ip, listen_port)
 
