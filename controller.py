@@ -14,9 +14,11 @@ import random
 import socket
 import stat
 import subprocess
-from subprocess import Popen
+from subprocess import Popen, PIPE
 import signal
+import sqlite3
 import sys
+import tempfile
 import time
 import threading
 from zeroconf import IPVersion, ServiceInfo, Zeroconf
@@ -62,7 +64,6 @@ def screen():
     data['playlist'] = playlist.playlist
     data['uris'] = playlist.uris
     data['streams'] = stream.streams
-    #data['uptime'] = System.uptime()
     json_data = json.dumps(data)
     return json_data
 
@@ -110,6 +111,12 @@ def download_file(url, path):
     return True
 
 
+def skip_comments(file):
+    for line in file:
+        if not line.strip().startswith('#'):
+            yield line.strip()
+
+
 class System:
 
     def list_processes(limit=0):
@@ -125,15 +132,92 @@ class System:
                               encoding="utf8").communicate()[0]
         return ps
 
-    def net_local_iface_address(probe_ip):
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect((probe_ip, 80))
+    def os_release():
+        data = ""
+        f = open('/etc/os-release')
+        for line in skip_comments(f):
+            if line.startswith("PRETTY_NAME"):
+                data += line.split("=")[1].strip('"')
+
+        return data
+
+    def sys_data():
+        sys = {"data" : None,
+               "uptime" : ""}
+        sysdata = Py3status("sysdata")
+        sys["data"] = sysdata.run_module()
+        uptime = Py3status("uptime")
+        sys["uptime"] = uptime.run_module()
+
+        return sys
+
+    def net_data(probe_ip):
+        net = {"address" : None,
+               "addresses" : "",
+               "public_ip" : "",
+               "online_status" : "",
+               "resolvconf" : ""}
+        net["address"] = System.net_iface_address(probe_ip)
+        net_iplist = Py3status("net_iplist")
+        net["addresses"] = net_iplist.run_module()
+        whatismyip = Py3status("whatismyip")
+        net["public_ip"] = whatismyip.run_module()
+        online_status = Py3status("online_status")
+        net["online_status"] = online_status.run_module()
+        net["resolvconf"] = System.net_resolvconf()
+
+        return net
+
+    def net_resolvconf():
+        data = ""
+        f = open('/etc/resolv.conf')
+        for line in skip_comments(f):
+            data += line
+        return data
+
+    def net_valid_ip_address(ip_address):
+        try:
+            socket.inet_pton(socket.AF_INET, ip_address)
+        except:
+            try:
+                socket.inet_pton(socket.AF_INET6, address)
+            except:
+                logging.warning('%s is an invalid IP address' % (ip_addr))
+                return False
+
+        return True
+
+    def net_iface_address(ip_address):
+
+        try:
+            socket.inet_pton(socket.AF_INET6, ip_address)
+            s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        except:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                socket.inet_pton(socket.AF_INET, ip_address)
+            except:
+                logging.warning('%s is an invalid IP address' % (ip_addr))
+                return False
+
+        try:
+            s.connect((ip_address, 80))
+        except OSError as e:
+            if e.errno == 51:
+                logging.info("%s is unreachable", ip_address)
+                return False
+            else:
+                raise
 
         return s.getsockname()[0]
 
     def uptime():
-        #return time.time() - psutil.boot_time()
-        return False
+        p = subprocess.Popen(['uptime'], shell=True,
+                                         stdout=subprocess.PIPE,
+                                         stderr=subprocess.STDOUT,
+                                         encoding="utf8")
+        output, error = p.communicate()
+        return output.strip()
 
 
 class Zeroconf_service:
@@ -233,11 +317,28 @@ class Playlist:
                 item["uri"] = uri
                 item["player"] = "mqtt"
                 item["play_time_s"] = self.default_play_time_s
+            elif uri.startswith("iss-music://"):
+                item["num"] = n
+                item["uri"] = uri
+                item["player"] = "music"
+                item["play_time_s"] = self.default_play_time_s
+            elif uri.startswith("iss-net://"):
+                item["num"] = n
+                item["uri"] = uri
+                item["player"] = "network"
+                item["play_time_s"] = self.default_play_time_s
             elif uri.startswith("iss-news://"):
-                self.news = News()
+                news_sources = {"hn" : "",
+                                "db" : "/home/mue/.local/share/russ/feeds.db"}
+                self.news = News(news_sources)
                 item["num"] = n
                 item["uri"] = uri
                 item["player"] = "news"
+                item["play_time_s"] = self.default_play_time_s
+            elif uri.startswith("iss-proc://"):
+                item["num"] = n
+                item["uri"] = uri
+                item["player"] = "processes"
                 item["play_time_s"] = self.default_play_time_s
             elif uri.startswith("iss-system://"):
                 item["num"] = n
@@ -275,7 +376,7 @@ class Playlist:
 
         return uris
 
-    def start_player(self):
+    def start_player(self, probe_ip):
         threads = list()
         for item in self.playlist:
             if item["player"] == "browser":
@@ -295,13 +396,23 @@ class Playlist:
                 x = threading.Thread(target=self.start_mqtt_views,
                                      args=(self.topics,
                                            self.theme,))
+            elif item["player"] == "music":
+                x = threading.Thread(target=self.start_music_view,
+                                     args=(self.theme.img_bg,))
+            elif item["player"] == "network":
+                x = threading.Thread(target=self.start_net_view,
+                                     args=(self.theme))
             elif item["player"] == "news":
                 x = threading.Thread(target=self.start_news_view,
                                      args=(self.news,
                                            self.theme.img_bg,))
+            elif item["player"] == "processes":
+                x = threading.Thread(target=self.start_proc_view,
+                                     args=(self.theme.img_bg,))
             elif item["player"] == "system":
                 x = threading.Thread(target=self.start_sys_view,
-                                     args=(self.theme.img_bg,))
+                                     args=(self.theme.img_bg,
+                                           probe_ip))
             elif item["player"] == "weather":
                 x = threading.Thread(target=self.start_weather_view,
                                      args=(self.weather,
@@ -386,7 +497,21 @@ class Playlist:
 
         return True
 
-    def start_sys_view(self, img_bg):
+    def start_net_view(self, probe_ip, img_bg):
+        texts = list()
+        net = System.net_data(probe_ip)
+        texts.append(net["address"])
+        texts.append(net["addresses"])
+        texts.append(net["public_ip"])
+        texts.append(net["resolvconf"])
+        view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
+        view.s_objects[0]["font_size"] = 14
+        view.s_objects[0]["alignment"] = "left"
+        view.s_objects[1]["font_size"] = 14
+        view.s_objects[1]["alignment"] = "left"
+        view.show_text(texts, img_bg)
+
+    def start_proc_view(self, img_bg):
         texts = list()
         texts.append(System.list_processes(23))
         view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
@@ -394,9 +519,49 @@ class Playlist:
         view.s_objects[0]["alignment"] = "left"
         view.show_text(texts, img_bg)
 
+    def start_sys_view(self, img_bg, probe_ip):
+        net = System.net_data(probe_ip)
+        sys = System.sys_data()
+        texts = list()
+        texts.append(System.os_release())
+        texts.append(System.uptime())
+        texts.append(sys["uptime"])
+        texts.append(sys["data"])
+        texts.append(net["address"])
+        texts.append(net["addresses"])
+        texts.append(net["online_status"] + " " + net["public_ip"])
+        texts.append(f"Listen address: {display.address}:{display.port}")
+        texts.append(f"Display Resolution: {display.res_x}x{display.res_y}")
+        view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
+        view.s_objects[0]["font_size"] = 24
+        view.s_objects[0]["alignment"] = "left"
+        view.s_objects[1]["font_size"] = 20
+        view.s_objects[1]["alignment"] = "left"
+        view.s_objects[2]["font_size"] = 20
+        view.s_objects[2]["alignment"] = "left"
+        view.s_objects[3]["font_size"] = 20
+        view.s_objects[3]["alignment"] = "left"
+        view.s_objects[4]["font_size"] = 20
+        view.s_objects[4]["alignment"] = "left"
+        view.s_objects[5]["font_size"] = 20
+        view.s_objects[5]["alignment"] = "left"
+        view.s_objects[6]["font_size"] = 20
+        view.s_objects[6]["alignment"] = "left"
+        view.s_objects[7]["font_size"] = 20
+        view.s_objects[7]["alignment"] = "left"
+        view.s_objects[8]["font_size"] = 20
+        view.s_objects[8]["alignment"] = "left"
+        view.show_text(texts, img_bg)
+
     def start_weather_view(self, weather, img_bg):
         texts = list()
-        data = weather.current_weather()
+        data, icon = weather.current_weather()
+
+        if not icon:
+            logging.debug(f"weather: No icon found for current condition")
+        else:
+            texts.append(icon)
+
         texts.append(data["current_condition"][0]["temp_C"] + "°C")
         texts.append(data["current_condition"][0]["weatherDesc"][0]["value"]
                      + " " +
@@ -410,14 +575,22 @@ class Playlist:
         view.s_objects[2]["font_size"] = 20
         view.s_objects[2]["alignment"] = "left"
         view.show_text(texts, img_bg)
+        view.show_image(icon)
+
+    def start_music_view(self, img_bg):
+        texts = list()
+        music = Music()
+        music_data = music.mpd()
+        texts.append(music_data)
+        view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
+        view.show_text(texts, img_bg)
 
     def start_news_view(self, news, img_bg):
         texts = list()
         item = news.news_item()
-        texts.append("[HN]")
+        texts.append(item["feed"])
         texts.append(item["title"])
         texts.append(item["url"])
-        logging.info("News: " + item["url"])
         view = Wayland_view(display.res_x, display.res_y, len(texts), theme)
         view.s_objects[0]["font_size"] = 30
         view.s_objects[1]["font_size"] = 60
@@ -551,6 +724,21 @@ class Stream():
             ])
 
 
+class Music:
+
+    def __init__(self):
+        self.music = {'mpd_data'   : False,
+                      'mpd_state'  : False,
+                      'mpd_artist' : "",
+                      'mpd_title'  : "",
+                      'mpd_album'  : ""}
+
+    def mpd(self):
+        mpd = Py3status("mpd")
+        data = mpd.run_module()
+        print(data)
+
+
 class MQTT:
 
     def __init__(self, broker, client_id, port=1883, user="", pw=""):
@@ -604,7 +792,7 @@ class MQTT:
             view.s_objects[0]["alignment"] = "center"
             view.s_objects[1]["font_size"] = 48
             view.s_objects[1]["alignment"] = "center"
-            view.show_text(texts, theme.img_bg)
+            view.show_text(texts, theme["img_bg"])
             self.mqtt_views.append(msg.topic)
 
         client.subscribe(topic)
@@ -613,11 +801,44 @@ class MQTT:
 
 class News:
 
-    def __init__(self):
+    def __init__(self, sources):
         self.news = []
-        self.fetch_top_news(10)
+        self.sqlite_select(sources["db"], "SELECT feeds.title, entries.title, entries.link, entries.pub_date FROM entries INNER JOIN feeds ON entries.feed_id = feeds.id ORDER BY pub_date DESC LIMIT 9")
+        #self.hn_fetch_top_news(10)
 
-    def fetch_top_news(self, nitems):
+    # news_item returns a single news text
+    # from the previously fetched ones
+    def news_item(self):
+        n = {"feed": "",
+             "title": "",
+             "url": ""}
+
+        n["feed"] = self.news[0].get('feed')
+        n["title"] = self.news[0].get('title')
+        n["url"] = self.news[0].get('url')
+        self.news.pop(0)
+
+        return n
+
+    def sqlite_select(self, db, query):
+        n = {"title": "",
+             "url": ""}
+
+        if not os.path.exists(db):
+            logging.error("News: Database does not exist %s", db)
+            return False
+
+        con = sqlite3.connect(db)
+        cur = con.cursor()
+        res = cur.execute(query)
+        r = res.fetchall()
+        for news in r:
+            logging.info("News: Appending news")
+            self.news.append({"feed"  : news[0],
+                              "title" : news[1],
+                              "url"   : news[2]})
+
+    def hn_fetch_top_news(self, nitems):
         n = 0
 
         logging.info("Fetching News")
@@ -631,17 +852,96 @@ class News:
             self.news.append(con.get_item(tnews))
             n += 1
 
-    # news_item returns a single news text
-    # from the previously fetched ones
-    def news_item(self):
-        n = {"title": "",
-             "url": ""}
 
-        n["title"] = self.news[0].get('title')
-        n["url"] = self.news[0].get('url')
-        self.news.pop(0)
+class Py3status:
 
-        return n
+    def __init__(self, module_name):
+        self.module_name = module_name
+        self.config_common = """
+general {
+    colors = true
+    interval = 5
+    color_good = "#96b5b4"
+}
+"""
+        self.module_config = {"mpd" : ""}
+        self.module_config["mpd"] = self.config_common + """
+order = "mpd"
+
+"""
+        self.module_config["net_iplist"] = self.config_common + """
+order = "net_iplist"
+
+net_iplist {
+    iface_blacklist = ['lo0']
+    ip_blacklist = ['127.*', '::1']
+    format = "{format_iface}"
+}
+"""
+        self.module_config["sysdata"] = self.config_common + """
+order = "sysdata"
+
+sysdata {
+    format = "CPU Histogram [\?color=cpu_used_percent {format_cpu}]"
+    format_cpu = "[\?if=used_percent>80 ⡇|[\?if=used_percent>60 ⡆"
+    format_cpu += "|[\?if=used_percent>40 ⡄|[\?if=used_percent>20 ⡀"
+    format_cpu += "|⠀]]]]"
+    format_cpu_separator = ""
+    thresholds = [(0, "good"), (60, "degraded"), (80, "bad")]
+    cache_timeout = 1
+}
+"""
+        self.module_config["online_status"] = self.config_common + """
+order = "online_status"
+"""
+        self.module_config["uptime"] = self.config_common + """
+order = "uptime"
+
+uptime {
+        format = 'up [\?if=weeks {weeks} weeks ][\?if=days {days} days ]
+        [\?if=hours {hours} hours ][\?if=minutes {minutes} minutes ]'
+}
+"""
+        self.module_config["whatismyip"] = self.config_common + """
+order = "whatismyip"
+
+whatismyip {
+        format = '{icon} {ip} {country} {city}'
+}
+"""
+
+    def run_module(self):
+        config_file = self.write_config()
+        cmd = 'py3status -c ' + config_file.name
+        logging.info(f"Py3status: Running module {self.module_name} {cmd}")
+        p = subprocess.Popen(cmd, shell=True,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT,
+                                  start_new_session=True,
+                                  close_fds=True,
+                                  encoding="utf8")
+        output, error = p.communicate()
+        output = output.replace("\n", "")
+        output = output.replace("[", "")
+        output = output.replace("]", "")
+        output = "[" + output + "]"
+        config_file.close()
+
+        try:
+            module_data = json.loads(output)
+            module_data = module_data[1]["full_text"]
+        except ValueError as e:
+            logging.error(f"Py3status: Failed to parse output as JSON: {output}")
+            return False
+
+        return module_data
+
+    def write_config(self):
+        tmp = tempfile.NamedTemporaryFile()
+        tmp.write(self.module_config[self.module_name].encode())
+        tmp.seek(0)
+
+        return tmp
 
 
 class Weather:
@@ -652,20 +952,11 @@ class Weather:
 
     def fetch_weather(self):
         url = "https://wttr.in/{}?format=j1".format(self.location)
-        logging.info("Fetching weather for {} at {}"
+        logging.info("iss-weather: Fetching weather for {} at {}"
                      .format(self.location, url))
 
-        cmd = ['curl ' + url]
-        p = subprocess.Popen(cmd,
-                             shell=True,
-                             stdout=subprocess.PIPE,
-                             stderr=subprocess.STDOUT,
-                             encoding="utf8")
-
-        #data = p.communicate()[0]
         try:
             data = requests.get(url, timeout=10)
-            data = data.content
         except requests.ReadTimeout as e:
             logging.error("weather: Timeout for request {}"
                           .format(e))
@@ -676,6 +967,7 @@ class Weather:
             logging.error("Failed to fetch weather data")
 
         try:
+            data = data.content
             data = json.loads(data)
         except ValueError as e:
             logging.error("weather: Failed to decode data")
@@ -683,7 +975,24 @@ class Weather:
             data = {}
             sys.exit(1)
 
-        return data
+        icon = self.icon(data["current_condition"][0]["weatherDesc"][0]["value"])
+
+        return data, icon
+
+    def icon(self, condition):
+        icon = False
+
+        if "Sunny" == condition:
+            condition = "clear"
+        elif "Clear" == condition:
+            condition = "clear"
+
+        fn = f"themes/default/weather/{condition}.svg"
+
+        if not os.path.exists(fn):
+            return False
+
+        return fn
 
     def current_weather(self):
         return self.weather
@@ -759,18 +1068,18 @@ class Wayland_view:
         if img_bg:
             self.s_objects[0]["file"] = img_bg
 
-        logging.info("view: Have {} text blocks".format(len(texts)))
+        logging.info("view: Have {} text block(s)".format(len(texts)))
 
         n = 0
         for text in texts:
-            logging.debug(text)
-            self.s_objects[n]["text"] = html.escape(text)
+            logging.debug(f"Showing text: {text}")
+            self.s_objects[n]["text"] = html.escape(str(text).replace("&", "&amp;"))
             n += 1
 
         w = view.Window(self.conn,
                         self.window,
                         self.s_objects,
-                        redraw=view.draw_image_with_text,
+                        redraw=view.draw_images_with_text,
                         fullscreen=fullscreen,
                         class_="iss-view")
 
@@ -783,7 +1092,7 @@ class Wayland_view:
         w = view.Window(self.conn,
                         self.window,
                         self.s_objects,
-                        redraw=view.draw_image_with_text,
+                        redraw=view.draw_images_with_text,
                         fullscreen=fullscreen,
                         class_="iss-view")
 
@@ -795,7 +1104,6 @@ class Display:
     def __init__(self, address, port, res_x=1366, res_y=768):
         self.address = address
         self.port = port
-        logging.info("Resolution: {}x{}".format(res_x, res_y))
         self.res_x = res_x
         self.res_y = res_y
         self.start_time = time.time()
@@ -835,7 +1143,7 @@ class Display:
 
     def get_windows_whitelist(self):
         windows = self.get_windows(self.window_blacklist)
-        logging.info("display: {} windows in whitelist".format(len(windows)))
+        logging.debug("display: {} windows in whitelist".format(len(windows)))
 
         return windows
 
@@ -900,8 +1208,7 @@ class Display:
             if len(self.switching_windows) == 0:
                 self.switching_windows = self.get_windows_whitelist()
                 if len(self.switching_windows) == 0:
-                    logging.warning("display: Expected windows to display \
-                                    but there is none")
+                    logging.debug("display: Expected windows to display but there is none")
 
                     continue
 
@@ -919,10 +1226,9 @@ class Display:
         logging.info("Finished task: {}".format(t))
 
         if len(self.switching_windows) == 0:
-            self.switching_windows = self.get_windows_whitelist()
+            self.switching_windows = self.get_windows_debugwhitelist()
             if len(self.switching_windows) == 0:
-                logging.warning("display: Expected windows to display \
-                                but there is none")
+                logging.debug("display: Expected windows to display but there is none")
 
                 return
 
@@ -1108,7 +1414,7 @@ if __name__ == "__main__":
     if args.uris[0].find("|") != -1:
         args.uris = args.uris[0].split("|")
     # Same for MQTT topics
-    if args.mqtt_topics[0].find("|") != -1:
+    if args.mqtt_topics and gs.mqtt_topics[0].find("|") != -1:
         args.mqtt_topics[0] = args.mqtt_topics[0].split("|")
 
     debug = args.debug
@@ -1191,11 +1497,9 @@ if __name__ == "__main__":
     hostname = socket.gethostname()
     local_ip = ""
 
-    try:
-        local_ip = System.net_local_iface_address(probe_ip)
-    except Exception:
-        logging.error("No network connection")
-        #exit(1)
+    local_ip = System.net_iface_address(probe_ip)
+    if not local_ip:
+        local_ip = System.net_iface_address(probe_ip)
 
     display = Display(local_ip, listen_port)
 
@@ -1207,7 +1511,7 @@ if __name__ == "__main__":
     theme = Theme(theme_name)
     logging.info("Using theme: {}".format(theme_name))
     playlist = Playlist(uris, 5, theme, mqtt_topics, location)
-    threads = playlist.start_player()
+    threads = playlist.start_player(probe_ip)
     logging.info("Started {} player".format(len(threads)))
     iss = Iss(threads)
 
@@ -1218,7 +1522,7 @@ if __name__ == "__main__":
         zc_listen_address = listen_address
 
         if "0.0.0.0" == zc_listen_address:
-            zc_listen_address = System.net_local_iface_address(probe_ip)
+            zc_listen_address = System.net_iface_address(probe_ip)
 
         zc_listen_port = listen_port
 
@@ -1243,7 +1547,7 @@ if __name__ == "__main__":
 
     # Set up signal handler
     def signal_handler(number, *args):
-        logging.info('Signal received:', number)
+        logging.info(f'Signal received: {number}')
 
         # Unpublish service
         if zeroconf_publish_service and zc:
@@ -1251,7 +1555,7 @@ if __name__ == "__main__":
 
         for thread in threads:
             logging.info("Stopping thread")
-            #thread.join()
+            thread.join()
 
         logging.shutdown()
 
