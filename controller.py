@@ -821,7 +821,7 @@ class Display:
         self.x.start()
 
     def get_socket_path(self):
-        cmd = ['/usr/local/bin/sway', '--get-socketpath']
+        cmd = ['sway', '--get-socketpath']
         p = subprocess.Popen(cmd,
                              shell=False,
                              stdout=subprocess.PIPE,
